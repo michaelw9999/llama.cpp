@@ -511,22 +511,26 @@ class ModelBase:
         return name == (key_name + suffix)
 
     def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
-        new_name = self.tensor_map.get_name(key=name, try_suffixes=try_suffixes)
-        if new_name is None:
-            raise ValueError(f"Can not map tensor {name!r}")
-        return new_name
+        names_to_try = [name]
+
+        if name.startswith("model.language_model."):
+            stripped = name.replace("model.language_model.", "", 1)
+            names_to_try.extend((f"model.{stripped}", stripped))
+        elif name.startswith("language_model."):
+            stripped = name.replace("language_model.", "", 1)
+            names_to_try.extend((stripped, f"model.{stripped}"))
+
+        for candidate in names_to_try:
+            new_name = self.tensor_map.get_name(key=candidate, try_suffixes=try_suffixes)
+            if new_name is not None:
+                return new_name
+
+        raise ValueError(f"Can not map tensor {name!r}")
 
     def set_gguf_parameters(self):
         raise NotImplementedError("set_gguf_parameters() must be implemented in subclasses")
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # skip NVFP4 auxiliary tensors (handled in _generate_nvfp4_tensors)
-        if self._is_nvfp4:
-            if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale", ".k_scale", ".v_scale")):
-                return []
-            if name.endswith(".weight") and name.replace(".weight", ".weight_scale") in self.model_tensors:
-                return []
-
         new_name = self.map_tensor_name(name)
 
         # Handle gate/up expert tensor fusion if enabled
@@ -591,6 +595,84 @@ class ModelBase:
     def _nvfp4_scale2_is_trivial(scale2: Tensor) -> bool:
         return scale2.numel() <= 1 and abs(float(scale2.float().sum()) - 1.0) < 1e-6
 
+    def _transform_nvfp4_weight(self, raw_weight_name: str, weight: Tensor, scale: Tensor, bid: int | None) -> tuple[str, Tensor, Tensor]:
+        def unpack_nibbles(qs: Tensor) -> Tensor:
+            lo = torch.bitwise_and(qs, 0x0F)
+            hi = torch.bitwise_right_shift(qs, 4)
+            return torch.stack((lo, hi), dim=-1).reshape(*qs.shape[:-1], qs.shape[-1] * 2)
+
+        def pack_nibbles(codes: Tensor) -> Tensor:
+            codes = codes.reshape(*codes.shape[:-1], codes.shape[-1] // 2, 2)
+            lo = torch.bitwise_and(codes[..., 0], 0x0F)
+            hi = torch.bitwise_left_shift(torch.bitwise_and(codes[..., 1], 0x0F), 4)
+            return torch.bitwise_or(lo, hi).contiguous()
+
+        def apply_col_perm(qs: Tensor, scales: Tensor, col_perm: Tensor) -> tuple[Tensor, Tensor] | None:
+            if qs.ndim < 2 or scales.ndim < 2:
+                return None
+
+            k = qs.shape[-1] * 2
+            if col_perm.numel() != k or k % 16 != 0:
+                return None
+
+            group_cols = col_perm.reshape(-1, 16)
+            group_starts = group_cols[:, 0]
+            expected = group_starts.unsqueeze(1) + torch.arange(16, dtype=col_perm.dtype)
+            if not torch.equal(group_cols, expected):
+                return None
+            if torch.any(group_starts % 16 != 0):
+                return None
+
+            group_perm = (group_starts // 16).to(dtype=torch.long)
+            expected_groups = torch.arange(scales.shape[-1], dtype=torch.long)
+            if group_perm.numel() != scales.shape[-1] or not torch.equal(torch.sort(group_perm).values, expected_groups):
+                return None
+
+            codes = unpack_nibbles(qs)
+            codes = codes.index_select(-1, col_perm.to(device=qs.device, dtype=torch.long))
+            qs = pack_nibbles(codes)
+            scales = scales.index_select(-1, group_perm.to(device=scales.device))
+            return qs, scales
+
+        dense_shape = list(weight.shape)
+        dense_shape[-1] *= 2
+        try:
+            probe = torch.arange(int(np.prod(dense_shape)), dtype=torch.float32).reshape(*dense_shape)
+            transformed = list(self.modify_tensors(probe, raw_weight_name, bid))
+        except Exception:
+            return self.map_tensor_name(raw_weight_name), weight, scale
+
+        if len(transformed) != 1:
+            return self.map_tensor_name(raw_weight_name), weight, scale
+
+        new_name, transformed_probe = transformed[0]
+        if not torch.is_tensor(transformed_probe) or tuple(transformed_probe.shape) != tuple(dense_shape):
+            return new_name, weight, scale
+
+        transformed_probe = transformed_probe.detach().cpu().round().to(dtype=torch.long)
+        if transformed_probe.ndim == 2:
+            nrow, ncol = dense_shape
+            col_perm = torch.remainder(transformed_probe[0], ncol)
+            row_perm = torch.div(transformed_probe[:, 0] - col_perm[0], ncol, rounding_mode="floor")
+
+            if (
+                row_perm.numel() == nrow and
+                col_perm.numel() == ncol and
+                torch.equal(torch.sort(row_perm).values, torch.arange(nrow, dtype=torch.long)) and
+                torch.equal(torch.sort(col_perm).values, torch.arange(ncol, dtype=torch.long))
+            ):
+                expected = probe.index_select(0, row_perm).index_select(1, col_perm)
+                if torch.equal(transformed_probe, expected):
+                    if not torch.equal(row_perm, torch.arange(nrow, dtype=torch.long)):
+                        weight = weight.index_select(0, row_perm.to(device=weight.device))
+                        scale = scale.index_select(0, row_perm.to(device=scale.device))
+                    if not torch.equal(col_perm, torch.arange(ncol, dtype=torch.long)):
+                        transformed_components = apply_col_perm(weight, scale, col_perm)
+                        if transformed_components is not None:
+                            weight, scale = transformed_components
+
+        return new_name, weight, scale
+
     def _repack_nvfp4(self, new_name: str, weight: Tensor, scale: Tensor, scale2: Tensor):
         raw, shape = self._nvfp4_pack(weight, scale)
         logger.info(f"Repacked {new_name} with shape {shape} and quantization NVFP4")
@@ -645,7 +727,9 @@ class ModelBase:
                 if n_experts > 0 and len(expert_blocks[key]) >= n_experts:
                     self._flush_nvfp4_experts(key, expert_blocks, expert_scales, expert_shapes, bid, proj_type)
             else:
-                new_name = self.map_tensor_name(name)
+                bid_m = re.search(r'\.layers\.(\d+)\.', name)
+                bid = int(bid_m.group(1)) if bid_m else None
+                new_name, weight, scale = self._transform_nvfp4_weight(name, weight, scale, bid)
                 self._repack_nvfp4(new_name, weight, scale, scale2)
 
         # Flush any remaining experts (fallback if n_experts was unknown)
@@ -701,6 +785,12 @@ class ModelBase:
             # we don't need these
             if name.endswith((".attention.masked_bias", ".attention.bias", ".rotary_emb.inv_freq")):
                 continue
+
+            if self._is_nvfp4:
+                if name.endswith(".weight") and name.replace(".weight", ".weight_scale") in self.model_tensors:
+                    continue
+                if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")):
+                    continue
 
             old_dtype = data_torch.dtype
 
@@ -922,7 +1012,6 @@ class ModelBase:
         except KeyError:
             raise NotImplementedError(f'Architecture {arch!r} not supported!') from None
 
-
 class TextModel(ModelBase):
     model_type = ModelType.TEXT
     hf_arch: str
@@ -1139,7 +1228,24 @@ class TextModel(ModelBase):
         toktypes: list[int] = []
 
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        except ValueError as e:
+            if "Tokenizer class TokenizersBackend does not exist" not in str(e):
+                raise
+
+            tokenizer_config = self.dir_model / "tokenizer_config.json"
+            if not tokenizer_config.is_file():
+                raise
+
+            with open(tokenizer_config, "r", encoding="utf-8") as f:
+                tokenizer_config_json = json.load(f)
+
+            if tokenizer_config_json.get("tokenizer_class") != "TokenizersBackend":
+                raise
+
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model, tokenizer_type="qwen2")
+
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
         assert max(tokenizer.vocab.values()) < vocab_size
 
