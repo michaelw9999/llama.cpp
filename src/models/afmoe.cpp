@@ -45,7 +45,7 @@ llm_build_afmoe::llm_build_afmoe(const llama_model & model, const llm_graph_para
                     n_embd_head, n_head, n_head_kv, il);
 
             // compute gate from input
-            ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp);
+            ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp, model.layers[il].wqkv_gate_s, model.layers[il].wqkv_gate_in_s);
             cb(gate, "attn_gate_proj", il);
 
             // Q/K normalization
@@ -80,7 +80,7 @@ llm_build_afmoe::llm_build_afmoe(const llama_model & model, const llm_graph_para
             cb(cur, "attn_gated", il);
 
             // now apply output projection
-            cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
+            cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s, model.layers[il].wo_in_s);
             cb(cur, "attn_o_proj", il);
         }
 
@@ -118,17 +118,27 @@ llm_build_afmoe::llm_build_afmoe(const llama_model & model, const llm_graph_para
                     hparams.expert_weights_norm,           // norm_w (route_norm=True)
                     hparams.expert_weights_scale,          // w_scale (route_scale=2.826)
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il);
+                    il,
+                    nullptr, nullptr,
+                    model.layers[il].ffn_up_exps_s,
+                    model.layers[il].ffn_gate_exps_s,
+                    model.layers[il].ffn_down_exps_s,
+                    model.layers[il].ffn_up_exps_in_s,
+                    model.layers[il].ffn_gate_exps_in_s,
+                    model.layers[il].ffn_down_exps_in_s);
             cb(moe_out, "ffn_moe_out", il);
 
             // shared expert
             if (hparams.n_expert_shared > 0) {
                 ggml_tensor * ffn_shexp = build_ffn(cur,
-                        model.layers[il].ffn_up_shexp,   NULL, NULL,
-                        model.layers[il].ffn_gate_shexp, NULL, NULL,
-                        model.layers[il].ffn_down_shexp, NULL, NULL,
+                        model.layers[il].ffn_up_shexp,   NULL, model.layers[il].ffn_up_shexp_s,
+                        model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+                        model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
                         NULL,
-                        LLM_FFN_SILU, LLM_FFN_PAR, il);
+                        LLM_FFN_SILU, LLM_FFN_PAR, il,
+                        model.layers[il].ffn_up_shexp_in_s,
+                        model.layers[il].ffn_gate_shexp_in_s,
+                        model.layers[il].ffn_down_shexp_in_s);
                 cb(ffn_shexp, "ffn_shexp", il);
 
                 cur = ggml_add(ctx0, moe_out, ffn_shexp);
@@ -139,11 +149,14 @@ llm_build_afmoe::llm_build_afmoe(const llama_model & model, const llm_graph_para
         } else {
             // dense layer
             cur = build_ffn(cur,
-                    model.layers[il].ffn_up,   NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
+                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                    model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
                     NULL,
-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+                    LLM_FFN_SILU, LLM_FFN_PAR, il,
+                    model.layers[il].ffn_up_in_s,
+                    model.layers[il].ffn_gate_in_s,
+                    model.layers[il].ffn_down_in_s);
             cb(cur, "ffn_out", il);
         }
 

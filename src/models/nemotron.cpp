@@ -51,7 +51,7 @@ llm_build_nemotron::llm_build_nemotron(const llama_model & model, const llm_grap
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s, model.layers[il].wo_in_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
@@ -73,7 +73,10 @@ llm_build_nemotron::llm_build_nemotron(const llama_model & model, const llm_grap
                 NULL,                      NULL,                        NULL,
                 model.layers[il].ffn_down, model.layers[il].ffn_down_b, NULL,
                 NULL,
-                LLM_FFN_RELU_SQR, LLM_FFN_SEQ, il);
+                LLM_FFN_RELU_SQR, LLM_FFN_SEQ, il,
+                model.layers[il].ffn_up_in_s,
+                nullptr,
+                model.layers[il].ffn_down_in_s);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
         cb(cur, "ffn_out", il);

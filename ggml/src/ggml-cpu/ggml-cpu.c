@@ -1148,6 +1148,16 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+static inline float ggml_mul_mat_get_attached_scale(const struct ggml_tensor * dst, int64_t channel) {
+    const struct ggml_tensor * scale = ggml_get_derived_tensor(dst, GGML_NVFP4_TENSOR_SCALE);
+    if (scale == NULL) {
+        return 1.0f;
+    }
+
+    const float * data = (const float *) scale->data;
+    return data[ggml_nelements(scale) == 1 ? 0 : channel];
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1228,6 +1238,16 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                }
+                const float scale = ggml_mul_mat_get_attached_scale(dst, i11);
+                if (scale != 1.0f) {
+                    const int64_t n = MIN(iir0 + blck_0, ir0_end) - iir0;
+                    for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                        float * t = tmp + cn * 16;
+                        for (int64_t k = 0; k < n; ++k) {
+                            t[k] *= scale;
+                        }
+                    }
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -1496,6 +1516,13 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                }
+                const float scale = ggml_mul_mat_get_attached_scale(dst, cur_a);
+                if (scale != 1.0f) {
+                    const int64_t n = MIN(iir0 + blck_0, ir0_end) - iir0;
+                    for (int64_t k = 0; k < n; ++k) {
+                        tmp[k] *= scale;
+                    }
                 }
 
                 memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));

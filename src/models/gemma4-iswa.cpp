@@ -62,7 +62,7 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
         // this is to mirror Gemma4Attention in pytorch code
         ggml_tensor * Qcur;
         {
-            Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s);
+            Qcur = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s, model.layers[il].wq_in_s);
             cb(Qcur, "Qcur", il);
 
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
@@ -77,11 +77,11 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
 
         // self-attention
         if (hparams.has_kv(il)) {
-            ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+            ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s, model.layers[il].wk_in_s);
             cb(Kcur, "Kcur", il);
 
             ggml_tensor * Vcur = model.layers[il].wv
-                                    ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s)
+                                    ? build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s, model.layers[il].wv_in_s)
                                     : Kcur; // if v_proj is not present, use Kcur as Vcur
             cb(Vcur, "Vcur", il);
 
@@ -100,12 +100,12 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
             cb(Kcur, "Kcur_pos", il);
 
             cur = build_attn(inp_attn, model.layers[il].wo,
-                    nullptr, model.layers[il].wo_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
+                    nullptr, model.layers[il].wo_s, model.layers[il].wo_in_s, Qcur, Kcur, Vcur, nullptr, nullptr, nullptr,
                     hparams.f_attention_scale, il);
         } else {
             // reuse KV cache of earlier layers
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, nullptr, model.layers[il].wo_s,
+                    model.layers[il].wo, nullptr, model.layers[il].wo_s, model.layers[il].wo_in_s,
                     Qcur, nullptr, nullptr, nullptr, nullptr, nullptr, hparams.f_attention_scale, il);
         }
 
@@ -136,7 +136,10 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
                     model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
                     nullptr,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+                    LLM_FFN_GELU, LLM_FFN_PAR, il,
+                    model.layers[il].ffn_up_in_s,
+                    model.layers[il].ffn_gate_in_s,
+                    model.layers[il].ffn_down_in_s);
             cur_mlp = build_norm(cur_mlp,
                     model.layers[il].ffn_post_norm_1, nullptr,
                     LLM_NORM_RMS, il);
@@ -169,7 +172,10 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
                     model.layers[il].ffn_gate_up_exps,
                     nullptr, // up_exps_s
                     nullptr, // gate_exps_s
-                    model.layers[il].ffn_down_exps_s);
+                    model.layers[il].ffn_down_exps_s,
+                    nullptr, // up_exps_in_s
+                    nullptr, // gate_exps_in_s
+                    model.layers[il].ffn_down_exps_in_s);
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
                     LLM_NORM_RMS, il);
@@ -188,7 +194,10 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
                     model.layers[il].ffn_gate, nullptr, model.layers[il].ffn_gate_s,
                     model.layers[il].ffn_down, nullptr, model.layers[il].ffn_down_s,
                     nullptr,
-                    LLM_FFN_GELU, LLM_FFN_PAR, il);
+                    LLM_FFN_GELU, LLM_FFN_PAR, il,
+                    model.layers[il].ffn_up_in_s,
+                    model.layers[il].ffn_gate_in_s,
+                    model.layers[il].ffn_down_in_s);
             cb(cur, "ffn_out", il);
         }
         cur = build_norm(cur,

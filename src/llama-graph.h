@@ -785,13 +785,16 @@ struct llm_graph_context {
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * w_in_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
-              ggml_tensor * ids) const;
+              ggml_tensor * ids,
+              ggml_tensor * w_s = nullptr,
+              ggml_tensor * w_in_s = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -821,11 +824,14 @@ struct llm_graph_context {
              ggml_tensor * gate_s,
              ggml_tensor * down,
              ggml_tensor * down_b,
-             ggml_tensor * down_s,
-             ggml_tensor * act_scales,
-         llm_ffn_op_type   type_op,
-       llm_ffn_gate_type   type_gate,
-                     int   il) const;
+         ggml_tensor * down_s,
+         ggml_tensor * act_scales,
+     llm_ffn_op_type   type_op,
+   llm_ffn_gate_type   type_gate,
+                 int   il,
+         ggml_tensor * up_in_s = nullptr,
+         ggml_tensor * gate_in_s = nullptr,
+         ggml_tensor * down_in_s = nullptr) const;
 
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
@@ -846,7 +852,11 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * up_exps_in_s = nullptr,
+             ggml_tensor * gate_exps_in_s = nullptr,
+             ggml_tensor * down_exps_in_s = nullptr,
+             ggml_tensor * gate_inp_s = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -871,7 +881,11 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps_b = nullptr,
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * up_exps_in_s = nullptr,
+             ggml_tensor * gate_exps_in_s = nullptr,
+             ggml_tensor * down_exps_in_s = nullptr,
+             ggml_tensor * gate_inp_s = nullptr) const;
 
     //
     // inputs
@@ -911,6 +925,7 @@ struct llm_graph_context {
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
+            ggml_tensor * wo_in_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
@@ -920,6 +935,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_no_cache * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const {
+        return build_attn(inp, wo, wo_b, wo_s, nullptr, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
+    }
+
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
     ggml_tensor * build_attn(
@@ -927,6 +958,7 @@ struct llm_graph_context {
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
+            ggml_tensor * wo_in_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
@@ -936,6 +968,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const {
+        return build_attn(inp, wo, wo_b, wo_s, nullptr, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
+    }
+
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 
     ggml_tensor * build_attn(
@@ -943,6 +991,7 @@ struct llm_graph_context {
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
+            ggml_tensor * wo_in_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
@@ -951,6 +1000,22 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il) const;
+
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const {
+        return build_attn(inp, wo, wo_b, wo_s, nullptr, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
+    }
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 
@@ -960,6 +1025,7 @@ struct llm_graph_context {
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
+            ggml_tensor * wo_in_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens] optional
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens] optional
@@ -969,6 +1035,22 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_kv_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const {
+        return build_attn(inp, wo, wo_b, wo_s, nullptr, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
+    }
+
     llm_graph_input_attn_cross * build_attn_inp_cross() const;
 
     ggml_tensor * build_attn(
@@ -976,6 +1058,7 @@ struct llm_graph_context {
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
+            ggml_tensor * wo_in_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
@@ -984,6 +1067,22 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
                     int   il) const;
+
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_cross * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il) const {
+        return build_attn(inp, wo, wo_b, wo_s, nullptr, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
+    }
 
     //
     // recurrent

@@ -2246,6 +2246,18 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     const ggml_op expected_bias_op = is_mul_mat ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
+    if ((ffn_up->op == GGML_OP_MUL_MAT || ffn_up->op == GGML_OP_MUL_MAT_ID) &&
+        (ggml_get_derived_tensor(ffn_up, GGML_NVFP4_TENSOR_SCALE) ||
+         ggml_get_derived_tensor(ffn_up, GGML_NVFP4_INPUT_SCALE))) {
+        return false;
+    }
+
+    if ((ffn_gate->op == GGML_OP_MUL_MAT || ffn_gate->op == GGML_OP_MUL_MAT_ID) &&
+        (ggml_get_derived_tensor(ffn_gate, GGML_NVFP4_TENSOR_SCALE) ||
+         ggml_get_derived_tensor(ffn_gate, GGML_NVFP4_INPUT_SCALE))) {
+        return false;
+    }
+
     if (has_bias) {
         if (ffn_up_bias->op != expected_bias_op || ffn_gate_bias->op != expected_bias_op) {
             return false;
@@ -4053,6 +4065,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                         ggml_cuda_mm_fusion_args_host fusion_data{};
                         fusion_data.x_bias = bias_tensor;
+                        // The NVFP4 weight scale is applied directly to mulmat via derived tensor
+                        fusion_data.scale_weight =
+                            (mm_node->op == GGML_OP_MUL_MAT || mm_node->op == GGML_OP_MUL_MAT_ID) ?
+                            ggml_get_derived_tensor(mm_node, GGML_NVFP4_TENSOR_SCALE) : nullptr;
 
                         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
                             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);

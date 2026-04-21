@@ -70,7 +70,7 @@ ggml_tensor * llm_build_nemotron_h::build_attention_layer(ggml_tensor *         
     const float kq_scale =
         hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
     cur = build_attn(inp_attn,
-            model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+            model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s, model.layers[il].wo_in_s,
             Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_out", il);
     return cur;
@@ -83,7 +83,10 @@ ggml_tensor * llm_build_nemotron_h::build_ffn_layer(ggml_tensor * cur, const lla
                 NULL,                      NULL,                        NULL,
                 model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
                 NULL,
-                LLM_FFN_RELU_SQR, LLM_FFN_PAR, il);
+                LLM_FFN_RELU_SQR, LLM_FFN_PAR, il,
+                model.layers[il].ffn_up_in_s,
+                nullptr,
+                model.layers[il].ffn_down_in_s);
         cb(cur, "ffn_out", il);
     } else {
         ggml_tensor * inp_emb    = cur;
@@ -111,7 +114,10 @@ ggml_tensor * llm_build_nemotron_h::build_ffn_layer(ggml_tensor * cur, const lla
                     router_logits, nullptr,
                     model.layers[il].ffn_up_exps_s,
                     nullptr, // no gate
-                    model.layers[il].ffn_down_exps_s);
+                    model.layers[il].ffn_down_exps_s,
+                    model.layers[il].ffn_up_exps_in_s,
+                    nullptr, // no gate
+                    model.layers[il].ffn_down_exps_in_s);
         cb(moe_out, "ffn_moe_out", il);
 
         if (model.layers[il].ffn_latent_up) {
@@ -123,7 +129,10 @@ ggml_tensor * llm_build_nemotron_h::build_ffn_layer(ggml_tensor * cur, const lla
                     NULL /* no gate */           ,   NULL, NULL,
                     model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
                     NULL,
-                    LLM_FFN_RELU_SQR, LLM_FFN_PAR, il);
+                    LLM_FFN_RELU_SQR, LLM_FFN_PAR, il,
+                    model.layers[il].ffn_up_shexp_in_s,
+                    nullptr,
+                    model.layers[il].ffn_down_shexp_in_s);
         cb(ffn_shexp, "ffn_shexp", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);

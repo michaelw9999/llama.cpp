@@ -642,6 +642,24 @@ extern "C" {
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
     };
 
+    enum ggml_derived_tensor_type {
+        GGML_NVFP4_TENSOR_SCALE  =   0, // ... this is the global fp32 tensor scale for NVFP4
+        GGML_NVFP4_INPUT_SCALE   =   1, // ... this is the matching fp32 activation scale per tensor scale
+
+        GGML_DERIVED_TENSOR_COUNT,
+    };
+
+    enum ggml_derived_tensor_flags {
+        GGML_DERIVED_TENSOR_FLAG_OPTIONAL = 0,  // This would determine if this tensor is required or optional
+        GGML_DERIVED_TENSOR_FLAG_REQUIRED = 1  
+    };
+
+    struct ggml_derived_tensor {      // The derived tensors here for now belong to mul_mat or mul_mat_id
+        struct ggml_tensor * tensor;
+        enum ggml_derived_tensor_type type;
+        enum ggml_derived_tensor_flags flags;
+    };
+
     enum ggml_tri_type {
         GGML_TRI_TYPE_UPPER_DIAG = 0,
         GGML_TRI_TYPE_UPPER      = 1,
@@ -1418,6 +1436,24 @@ extern "C" {
     GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // Create a derived_tensor to attach as aux tensors to a matmul op.
+    GGML_API struct ggml_derived_tensor ggml_create_derived_tensor(
+                struct ggml_tensor * tensor,
+                enum ggml_derived_tensor_type type,
+                enum ggml_derived_tensor_flags flags);
+    // compatible with ops GML_OP_MUL_MAT or GGML_OP_MUL_MAT_ID
+    GGML_API void ggml_mul_mat_add_derived_tensor(
+                struct ggml_tensor * t,
+                struct ggml_derived_tensor derived);
+
+    GGML_API struct ggml_tensor * ggml_get_derived_tensor(
+            const struct ggml_tensor * t,
+            enum ggml_derived_tensor_type type);
+
+    GGML_API enum ggml_derived_tensor_flags ggml_get_derived_tensor_flags(
+            const struct ggml_tensor * t,
+            enum ggml_derived_tensor_type type);
 
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
