@@ -3252,11 +3252,143 @@ struct ggml_tensor * ggml_mul_mat(
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT || a->op == GGML_OP_MUL_MAT_ID);
 
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 0, prec_i32);
+}
+
+enum {
+    GGML_MUL_MAT_DERIVED_TENSOR_OP_PARAM_PREC  = 0,
+    GGML_MUL_MAT_DERIVED_TENSOR_OP_PARAM_COUNT = 1,
+    GGML_MUL_MAT_DERIVED_TENSOR_HEADER_SIZE    = 2 * (int) sizeof(int32_t),
+    GGML_MUL_MAT_DERIVED_TENSOR_ENTRY_SIZE     = (int) sizeof(uintptr_t) + 2 * (int) sizeof(int32_t),
+    GGML_MUL_MAT_MAX_DERIVED_TENSORS           = (GGML_MAX_OP_PARAMS - GGML_MUL_MAT_DERIVED_TENSOR_HEADER_SIZE) / GGML_MUL_MAT_DERIVED_TENSOR_ENTRY_SIZE,
+};
+
+static_assert(GGML_MUL_MAT_MAX_DERIVED_TENSORS >= 2, "mul_mat derived tensor storage must hold at least 2 entries");
+
+static struct ggml_derived_tensor ggml_mul_mat_get_derived_tensor_entry(const struct ggml_tensor * t, int index) {
+    GGML_ASSERT(index >= 0);
+    GGML_ASSERT(index < ggml_get_op_params_i32(t, GGML_MUL_MAT_DERIVED_TENSOR_OP_PARAM_COUNT));
+    GGML_ASSERT(index < GGML_MUL_MAT_MAX_DERIVED_TENSORS);
+
+    const uint8_t * entry = (const uint8_t *) t->op_params +
+        GGML_MUL_MAT_DERIVED_TENSOR_HEADER_SIZE + (size_t) index * GGML_MUL_MAT_DERIVED_TENSOR_ENTRY_SIZE;
+
+    uintptr_t tensor_ptr = 0;
+    int32_t type_i32 = 0;
+    int32_t flags_i32 = 0;
+
+    memcpy(&tensor_ptr, entry, sizeof(tensor_ptr));
+    entry += sizeof(tensor_ptr);
+    memcpy(&type_i32, entry, sizeof(type_i32));
+    entry += sizeof(type_i32);
+    memcpy(&flags_i32, entry, sizeof(flags_i32));
+
+    struct ggml_derived_tensor derived = {
+        /*.tensor =*/ (struct ggml_tensor *) tensor_ptr,
+        /*.type   =*/ (enum ggml_derived_tensor_type) type_i32,
+        /*.flags  =*/ (enum ggml_derived_tensor_flags) flags_i32,
+    };
+
+    return derived;
+}
+
+static void ggml_mul_mat_set_derived_tensor_entry(struct ggml_tensor * t, int index, struct ggml_derived_tensor derived) {
+    GGML_ASSERT(index >= 0);
+    GGML_ASSERT(index < GGML_MUL_MAT_MAX_DERIVED_TENSORS);
+
+    const uintptr_t tensor_ptr = (uintptr_t) derived.tensor;
+    const int32_t type_i32 = (int32_t) derived.type;
+    const int32_t flags_i32 = (int32_t) derived.flags;
+
+    uint8_t * entry = (uint8_t *) t->op_params +
+        GGML_MUL_MAT_DERIVED_TENSOR_HEADER_SIZE + (size_t) index * GGML_MUL_MAT_DERIVED_TENSOR_ENTRY_SIZE;
+
+    memcpy(entry, &tensor_ptr, sizeof(tensor_ptr));
+    entry += sizeof(tensor_ptr);
+    memcpy(entry, &type_i32, sizeof(type_i32));
+    entry += sizeof(type_i32);
+    memcpy(entry, &flags_i32, sizeof(flags_i32));
+}
+
+struct ggml_derived_tensor ggml_create_derived_tensor(
+        struct ggml_tensor * tensor,
+        enum ggml_derived_tensor_type type,
+        enum ggml_derived_tensor_flags flags) {
+    GGML_ASSERT(type >= 0 && type < GGML_DERIVED_TENSOR_COUNT);
+
+    struct ggml_derived_tensor derived = {
+        /*.tensor =*/ tensor,
+        /*.type   =*/ type,
+        /*.flags  =*/ flags,
+    };
+
+    return derived;
+}
+
+void ggml_mul_mat_add_derived_tensor(
+        struct ggml_tensor * t,
+        struct ggml_derived_tensor derived) {
+    GGML_ASSERT(t != NULL);
+    GGML_ASSERT(t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(derived.type >= 0 && derived.type < GGML_DERIVED_TENSOR_COUNT);
+
+    if (derived.tensor == NULL) {
+        GGML_ASSERT((derived.flags & GGML_DERIVED_TENSOR_FLAG_REQUIRED) == 0);
+        return;
+    }
+
+    const int count = ggml_get_op_params_i32(t, GGML_MUL_MAT_DERIVED_TENSOR_OP_PARAM_COUNT);
+    for (int i = 0; i < count; ++i) {
+        const struct ggml_derived_tensor existing = ggml_mul_mat_get_derived_tensor_entry(t, i);
+        if (existing.type == derived.type) {
+            ggml_mul_mat_set_derived_tensor_entry(t, i, derived);
+            return;
+        }
+    }
+
+    GGML_ASSERT(count < GGML_MUL_MAT_MAX_DERIVED_TENSORS);
+    ggml_mul_mat_set_derived_tensor_entry(t, count, derived);
+    ggml_set_op_params_i32(t, GGML_MUL_MAT_DERIVED_TENSOR_OP_PARAM_COUNT, count + 1);
+}
+
+struct ggml_tensor * ggml_get_derived_tensor(
+        const struct ggml_tensor * t,
+        enum ggml_derived_tensor_type type) {
+    GGML_ASSERT(t != NULL);
+    GGML_ASSERT(t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(type >= 0 && type < GGML_DERIVED_TENSOR_COUNT);
+
+    const int count = ggml_get_op_params_i32(t, GGML_MUL_MAT_DERIVED_TENSOR_OP_PARAM_COUNT);
+    for (int i = 0; i < count; ++i) {
+        const struct ggml_derived_tensor derived = ggml_mul_mat_get_derived_tensor_entry(t, i);
+        if (derived.type == type) {
+            return derived.tensor;
+        }
+    }
+
+    return NULL;
+}
+
+enum ggml_derived_tensor_flags ggml_get_derived_tensor_flags(
+        const struct ggml_tensor * t,
+        enum ggml_derived_tensor_type type) {
+    GGML_ASSERT(t != NULL);
+    GGML_ASSERT(t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID);
+    GGML_ASSERT(type >= 0 && type < GGML_DERIVED_TENSOR_COUNT);
+
+    const int count = ggml_get_op_params_i32(t, GGML_MUL_MAT_DERIVED_TENSOR_OP_PARAM_COUNT);
+    for (int i = 0; i < count; ++i) {
+        const struct ggml_derived_tensor derived = ggml_mul_mat_get_derived_tensor_entry(t, i);
+        if (derived.type == type) {
+            return derived.flags;
+        }
+    }
+
+    return GGML_DERIVED_TENSOR_FLAG_OPTIONAL;
 }
 
 // ggml_mul_mat_id
