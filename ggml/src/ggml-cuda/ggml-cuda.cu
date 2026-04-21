@@ -2224,6 +2224,83 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
+static bool ggml_cuda_has_mul_mat_derived_scales(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+
+    if (tensor->op != GGML_OP_MUL_MAT && tensor->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+
+    return ggml_get_derived_tensor(tensor, GGML_NVFP4_TENSOR_SCALE) != nullptr ||
+           ggml_get_derived_tensor(tensor, GGML_NVFP4_INPUT_SCALE) != nullptr;
+}
+
+static __global__ void k_mul_mat_apply_derived_scales(
+        float * dst,
+        const float * scale_weight,
+        const float * scale_input,
+        const int64_t scale_weight_ne,
+        const int64_t scale_input_ne,
+        const int64_t ne0,
+        const int64_t ne1,
+        const int64_t ne) {
+    const int64_t idx = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= ne) {
+        return;
+    }
+
+    const int64_t i1 = (idx / ne0) % ne1;
+
+    float scale = 1.0f;
+    if (scale_weight != nullptr) {
+        scale *= scale_weight[scale_weight_ne == 1 ? 0 : i1];
+    }
+    if (scale_input != nullptr) {
+        scale *= scale_input[scale_input_ne == 1 ? 0 : i1];
+    }
+
+    dst[idx] *= scale;
+}
+
+static void ggml_cuda_apply_mul_mat_derived_scales(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * scale_weight = ggml_get_derived_tensor(dst, GGML_NVFP4_TENSOR_SCALE);
+    const ggml_tensor * scale_input  = ggml_get_derived_tensor(dst, GGML_NVFP4_INPUT_SCALE);
+
+    if (scale_weight == nullptr && scale_input == nullptr) {
+        return;
+    }
+
+    if (ggml_backend_buft_is_cuda_split(dst->buffer->buft)) {
+        return;
+    }
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_weight == nullptr || scale_weight->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_input == nullptr || scale_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_weight == nullptr || ggml_nelements(scale_weight) == 1 || ggml_nelements(scale_weight) == dst->ne[1]);
+    GGML_ASSERT(scale_input == nullptr || ggml_nelements(scale_input) == 1 || ggml_nelements(scale_input) == dst->ne[1]);
+
+    const int64_t ne = ggml_nelements(dst);
+    if (ne == 0) {
+        return;
+    }
+
+    constexpr int threads = 256;
+    const int blocks = (ne + threads - 1) / threads;
+    k_mul_mat_apply_derived_scales<<<blocks, threads, 0, ctx.stream()>>>(
+            (float *) dst->data,
+            scale_weight ? (const float *) scale_weight->data : nullptr,
+            scale_input  ? (const float *) scale_input->data  : nullptr,
+            scale_weight ? ggml_nelements(scale_weight) : 0,
+            scale_input  ? ggml_nelements(scale_input)  : 0,
+            dst->ne[0],
+            dst->ne[1],
+            ne);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -2241,6 +2318,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
     if (!is_mul_mat && !is_mul_mat_id) {
+        return false;
+    }
+
+    if (ggml_cuda_has_mul_mat_derived_scales(ffn_up) || ggml_cuda_has_mul_mat_derived_scales(ffn_gate)) {
         return false;
     }
 
@@ -2314,6 +2395,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
+    if (ggml_cuda_has_mul_mat_derived_scales(tensor)) {
+        return false;
+    }
+
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
     bool use_mul_mat_vec_f =
@@ -2348,6 +2433,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (ggml_cuda_has_mul_mat_derived_scales(tensor)) {
+        return false;
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
@@ -2465,6 +2554,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     } else {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
     }
+
+    ggml_cuda_apply_mul_mat_derived_scales(ctx, dst);
 }
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2488,11 +2579,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_apply_mul_mat_derived_scales(ctx, dst);
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                    ggml_cuda_apply_mul_mat_derived_scales(ctx, dst);
                     return;
                 }
             }
@@ -2500,11 +2593,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            ggml_cuda_apply_mul_mat_derived_scales(ctx, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            ggml_cuda_apply_mul_mat_derived_scales(ctx, dst);
             return;
         }
     }
@@ -2623,6 +2718,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+    ggml_cuda_apply_mul_mat_derived_scales(ctx, dst);
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {

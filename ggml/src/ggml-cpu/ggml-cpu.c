@@ -1149,13 +1149,21 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 // ggml_compute_forward_mul_mat
 
 static inline float ggml_mul_mat_get_attached_scale(const struct ggml_tensor * dst, int64_t channel) {
-    const struct ggml_tensor * scale = ggml_get_derived_tensor(dst, GGML_NVFP4_TENSOR_SCALE);
-    if (scale == NULL) {
-        return 1.0f;
+    float scale = 1.0f;
+
+    const struct ggml_tensor * weight_scale = ggml_get_derived_tensor(dst, GGML_NVFP4_TENSOR_SCALE);
+    if (weight_scale != NULL) {
+        const float * data = (const float *) weight_scale->data;
+        scale *= data[ggml_nelements(weight_scale) == 1 ? 0 : channel];
     }
 
-    const float * data = (const float *) scale->data;
-    return data[ggml_nelements(scale) == 1 ? 0 : channel];
+    const struct ggml_tensor * input_scale = ggml_get_derived_tensor(dst, GGML_NVFP4_INPUT_SCALE);
+    if (input_scale != NULL) {
+        const float * data = (const float *) input_scale->data;
+        scale *= data[ggml_nelements(input_scale) == 1 ? 0 : channel];
+    }
+
+    return scale;
 }
 
 static void ggml_compute_forward_mul_mat_one_chunk(
