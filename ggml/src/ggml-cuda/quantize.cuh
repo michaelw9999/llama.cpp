@@ -39,3 +39,25 @@ void quantize_mmq_mxfp4_cuda(const float *   x,
                              int64_t         ne2,
                              int64_t         ne3,
                              cudaStream_t    stream);
+
+void quantize_row_nvfp4_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+void quantize_mmq_nvfp4_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+void quantize_mmvq_nvfp4_cuda(
+        const float * x, const int32_t * ids, void * vy,
+        ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+template <bool has_ids>
+void quantize_mmq_fp4_cuda(
+        const float * x, const int32_t * ids, const int32_t * ids_expert, void * vy,
+        ggml_type type_src0, const ggml_tensor * input_scale,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
