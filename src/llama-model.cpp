@@ -1514,6 +1514,75 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+
+    auto backend_has_feature = [](ggml_backend_dev_t dev, const char * name) {
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            return false;
+        }
+        auto get_features = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+        if (get_features == nullptr) {
+            return false;
+        }
+        const ggml_backend_feature * features = get_features(reg);
+        if (features == nullptr) {
+            return false;
+        }
+        for (const ggml_backend_feature * feature = features; feature->name != nullptr; ++feature) {
+            if (strcmp(feature->name, name) == 0 && strcmp(feature->value, "1") == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto use_mxfp6_cuda_native_scales = [&](ggml_backend_dev_t dev) {
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 &&
+            backend_has_feature(dev, "BLACKWELL_NATIVE_MXFP6");
+    };
+
+    auto attach_mxfp6_cuda_scales = [](ggml_tensor * weight, ggml_tensor *& weight_scale, ggml_tensor * input_scale, bool use_cuda_native_scales) {
+        if (weight == nullptr || weight->type != GGML_TYPE_MXFP6_E2M3) {
+            return;
+        }
+
+        weight->src[0] = weight_scale;
+        weight->src[1] = input_scale;
+        if (use_cuda_native_scales) {
+            weight_scale = nullptr;
+        }
+    };
+
+    for (int il = 0; il < n_layer_all; ++il) {
+        auto & layer = layers[il];
+        const bool use_cuda_native_scales = use_mxfp6_cuda_native_scales(pimpl->dev_layer[il].dev);
+        attach_mxfp6_cuda_scales(layer.wq,              layer.wq_s,              layer.wq_in_s,              use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.wk,              layer.wk_s,              layer.wk_in_s,              use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.wv,              layer.wv_s,              layer.wv_in_s,              use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.wo,              layer.wo_s,              layer.wo_in_s,              use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.wqkv,            layer.wqkv_s,            layer.wqkv_in_s,            use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.wqkv_gate,       layer.wqkv_gate_s,       layer.wqkv_gate_in_s,       use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_gate,        layer.ffn_gate_s,        layer.ffn_gate_in_s,        use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_down,        layer.ffn_down_s,        layer.ffn_down_in_s,        use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_up,          layer.ffn_up_s,          layer.ffn_up_in_s,          use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_gate_exps,   layer.ffn_gate_exps_s,   layer.ffn_gate_exps_in_s,   use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_down_exps,   layer.ffn_down_exps_s,   layer.ffn_down_exps_in_s,   use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_up_exps,     layer.ffn_up_exps_s,     layer.ffn_up_exps_in_s,     use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_gate_shexp,  layer.ffn_gate_shexp_s,  layer.ffn_gate_shexp_in_s,  use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_down_shexp,  layer.ffn_down_shexp_s,  layer.ffn_down_shexp_in_s,  use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ffn_up_shexp,    layer.ffn_up_shexp_s,    layer.ffn_up_shexp_in_s,    use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ssm_in,          layer.ssm_in_s,          layer.ssm_in_in_s,          use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ssm_out,         layer.ssm_out_s,         layer.ssm_out_in_s,         use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ssm_alpha,       layer.ssm_alpha_s,       layer.ssm_alpha_in_s,       use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.ssm_beta,        layer.ssm_beta_s,        layer.ssm_beta_in_s,        use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.nextn.eh_proj,   layer.nextn.eh_proj_s,   layer.nextn.eh_proj_in_s,   use_cuda_native_scales);
+        attach_mxfp6_cuda_scales(layer.nextn.shared_head_head,
+                                 layer.nextn.shared_head_head_s,
+                                 layer.nextn.shared_head_head_in_s,
+                                 use_cuda_native_scales);
+    }
+
     ml.done_getting_tensors();
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.

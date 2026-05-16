@@ -77,6 +77,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cfloat>
 #include <initializer_list>
 #include <limits>
@@ -784,6 +785,12 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    if (tensor->type == GGML_TYPE_MXFP6_E2M3 && offset == 0 && size >= MXFP6_HEADER_OFFSET) {
+        tensor_mxfp6 header;
+        memcpy(&header, data, MXFP6_HEADER_OFFSET);
+        ggml_cuda_mxfp6_e2m3_patch_tensor_header(tensor, &header);
+        CUDA_CHECK(cudaMemcpyAsync(tensor->data, &header, MXFP6_HEADER_OFFSET, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -1854,11 +1861,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) &&
+            !(src0->type == GGML_TYPE_MXFP6_E2M3 && src0->view_src != nullptr)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0) &&
+            !(src0->type == GGML_TYPE_MXFP6_E2M3 && src0->view_src != nullptr)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -1962,7 +1971,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
 
     get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
-        ne10, nb11, nb12, nb13,
+        ne10, ne11, nb11, nb12, nb13,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
@@ -2017,7 +2026,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
-        ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
+        ne0, ne_get_rows, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
 }
@@ -2401,6 +2410,12 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    if (tensor->type == GGML_TYPE_MXFP6_E2M3 && offset == 0 && size >= MXFP6_HEADER_OFFSET) {
+        tensor_mxfp6 header;
+        memcpy(&header, data, MXFP6_HEADER_OFFSET);
+        ggml_cuda_mxfp6_e2m3_patch_tensor_header(tensor, &header);
+        CUDA_CHECK(cudaMemcpyAsync(tensor->data, &header, MXFP6_HEADER_OFFSET, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    }
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3828,7 +3843,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+        if (src0->type != GGML_TYPE_MXFP6_E2M3 && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -4823,6 +4838,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
+                    case GGML_TYPE_MXFP6_E2M3:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
@@ -4874,6 +4890,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_MXFP6_E2M3:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
@@ -5312,6 +5329,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
         for (int id = 0; id < info.device_count; ++id) {
             if (blackwell_mma_available(info.devices[id].cc)) {
                 features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
+                features.push_back({ "BLACKWELL_NATIVE_MXFP6", "1"});
                 break;
             }
         }
