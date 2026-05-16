@@ -5016,10 +5016,11 @@ struct test_mul_mat : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
+        // for blackwell we quantize activations to native low-bit formats instead of q8_1 so we add higher tolerance
+        if ((type_a == GGML_TYPE_MXFP6_E2M3 && backend_has_feature(backend, "BLACKWELL_NATIVE_MXFP6")) ||
+                ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
                 !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4"))) {
             return 2e-2;
         }
         return max_nmse_err();
@@ -5275,10 +5276,11 @@ struct test_mul_mat_id : public test_case {
     }
 
     double max_nmse_err(ggml_backend_t backend) override {
-        // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
-        if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
+        // for blackwell we quantize activations to native low-bit formats instead of q8_1 so we add higher tolerance
+        if ((type_a == GGML_TYPE_MXFP6_E2M3 && backend_has_feature(backend, "BLACKWELL_NATIVE_MXFP6")) ||
+                ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
                 !graph_mul_mat_hi_prec_act(gf, GGML_OP_MUL_MAT_ID) &&
-                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+                backend_has_feature(backend, "BLACKWELL_NATIVE_FP4"))) {
             return 2e-2;
         }
         return max_nmse_err();

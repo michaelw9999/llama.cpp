@@ -328,7 +328,63 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     return d * sumi;
 }
 
-#define VDR_NVFP4_Q8_1_MMVQ 4
+static __device__ __forceinline__ int mxfp6_e2m3_dp4a_operand(const uint32_t codes) {
+    const uint32_t c0 = (codes >>  0) & 0x3f;
+    const uint32_t c1 = (codes >>  8) & 0x3f;
+    const uint32_t c2 = (codes >> 16) & 0x3f;
+    const uint32_t c3 = (codes >> 24) & 0x3f;
+
+    return
+        ((uint32_t)(uint8_t) kvalues_mxfp6_e2m3[c0]      ) |
+        ((uint32_t)(uint8_t) kvalues_mxfp6_e2m3[c1] <<  8) |
+        ((uint32_t)(uint8_t) kvalues_mxfp6_e2m3[c2] << 16) |
+        ((uint32_t)(uint8_t) kvalues_mxfp6_e2m3[c3] << 24);
+}
+
+#define VDR_MXFP6_E2M3_Q8_1_MMVQ 8
+#define VDR_MXFP6_E2M3_Q8_1_MMQ  8
+
+#if defined(BLACKWELL_MMA_AVAILABLE)
+static __device__ __forceinline__ float vec_dot_mxfp6_e2m3_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint32_t channel_x) {
+
+    static_assert(VDR_MXFP6_E2M3_Q8_1_MMVQ <= 8, "MXFP6_E2M3 MMVQ VDR must stay within one scale fragment.");
+
+    const uint32_t packed_kbx = (uint32_t) kbx;
+    const int row_in_tile = packed_kbx >> 28;
+    const uint32_t block_rel = packed_kbx & 0x0FFFFFFFu;
+    const tensor_mxfp6 * tensor = (const tensor_mxfp6 *) vbq;
+    const tile_mxfp6_frag & frag_block =
+        ((const tile_mxfp6_frag *) ((const char *) tensor + MXFP6_HEADER_OFFSET))[block_rel];
+    float tensor_scale = tensor->weight_scales ? tensor->weight_scales[channel_x] : tensor->weight_scale;
+    tensor_scale = tensor_scale > 0.0f ? tensor_scale : 1.0f;
+
+    const int frag = iqs >> 3;
+    const int word0 = iqs & 7;
+    const block_q8_1 * bq8 = bq8_1 + frag;
+    const uint8_t scale_code = frag_block.scale[((row_in_tile & 7) * 4) + (row_in_tile >> 3)];
+    const float d = tensor_scale * ggml_cuda_e8m0_to_fp32(scale_code) *
+        __low2float(bq8->ds) * (1.0f / 8.0f);
+    float sum = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP6_E2M3_Q8_1_MMVQ; ++l) {
+        const int word  = word0 + l;
+
+        const int x4 = mxfp6_e2m3_dp4a_operand(
+            ggml_cuda_mxfp6_e2m3_frag_codes_to_lanes(frag_block, row_in_tile, word));
+        const int y4 = get_int_b4(bq8->qs, word);
+
+        const int sumi = ggml_cuda_dp4a(x4, y4, 0);
+        sum += d * float(sumi);
+    }
+
+    return sum;
+}
+
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+
+#define VDR_NVFP4_Q8_1_MMVQ 2
 #define VDR_NVFP4_Q8_1_MMQ  8
 
 static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
@@ -360,6 +416,7 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4
 
