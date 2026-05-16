@@ -1151,10 +1151,108 @@ namespace ggml_cuda_mma {
 #else
         GGML_UNUSED_VARS(D, A, B, a_scale, b_scale);
 #endif // BLACKWELL_MMA_AVAILABLE
-    }
+	    }
 
-    static __device__ __forceinline__ void mma(
-            tile<16, 8, float> & D, const tile<16, 8, half2> & A, const tile<8, 8, half2> & B) {
+	    template <bool need_check>
+	    static __device__ __forceinline__ void mma_block_scaled_mxfp6_e2m3(
+	            tile<16, 8, float> & D,
+	            const tile_mxfp6_frag * __restrict__ A, int blocks_per_row, int row_base, int frag_abs, int row_max,
+	            const tile<8, 8, int> & B, uint32_t b_scale) {
+	#ifdef BLACKWELL_MMA_AVAILABLE
+	        const int lane = int(threadIdx.x) & 31;
+	        uint32_t A0;
+	        uint32_t A1;
+	        uint32_t A2;
+	        uint32_t A3;
+	        uint32_t a_scale;
+
+	        if constexpr (!need_check) {
+	            GGML_UNUSED(row_max);
+	            const tile_mxfp6_frag & frag = A[(row_base >> 4) * blocks_per_row + frag_abs];
+	            const uint32_t w0 = frag.lane[lane][0];
+	            const uint32_t w1 = frag.lane[lane][1];
+	            const uint32_t w2 = frag.lane[lane][2];
+            A0 = ggml_cuda_mxfp6_e2m3_codes_to_lanes(w0);
+            A1 = ggml_cuda_mxfp6_e2m3_codes_to_lanes((w0 >> 24) | (w1 << 8));
+            A2 = ggml_cuda_mxfp6_e2m3_codes_to_lanes((w1 >> 16) | (w2 << 16));
+            A3 = ggml_cuda_mxfp6_e2m3_codes_to_lanes(w2 >> 8);
+	            a_scale = frag.scale[lane];
+	        } else {
+	            int row_lo_abs = row_base + (lane >> 2);
+	            int row_hi_abs = row_lo_abs + 8;
+	            const bool row_lo_valid = row_lo_abs <= row_max;
+	            const bool row_hi_valid = row_hi_abs <= row_max;
+	            row_lo_abs = min(row_lo_abs, row_max);
+	            row_hi_abs = min(row_hi_abs, row_max);
+
+	            if (!row_lo_valid) {
+	                A0 = 0;
+	                A1 = 0;
+	                A2 = 0;
+	                A3 = 0;
+	                a_scale = 0x7Fu;
+	            } else {
+	                const tile_mxfp6_frag & frag_lo = A[(row_lo_abs >> 4) * blocks_per_row + frag_abs];
+	                const tile_mxfp6_frag & frag_hi = A[(row_hi_abs >> 4) * blocks_per_row + frag_abs];
+	                const int row_lo = row_lo_abs & 15;
+	                const int row_hi = row_hi_abs & 15;
+	                const int word_idx = lane & 3;
+
+                A0 = row_lo_valid ? ggml_cuda_mxfp6_e2m3_frag_codes_to_lanes(frag_lo, row_lo, word_idx + 0) : 0;
+                A1 = row_hi_valid ? ggml_cuda_mxfp6_e2m3_frag_codes_to_lanes(frag_hi, row_hi, word_idx + 0) : 0;
+                A2 = row_lo_valid ? ggml_cuda_mxfp6_e2m3_frag_codes_to_lanes(frag_lo, row_lo, word_idx + 4) : 0;
+                A3 = row_hi_valid ? ggml_cuda_mxfp6_e2m3_frag_codes_to_lanes(frag_hi, row_hi, word_idx + 4) : 0;
+
+	                const int tid = lane & 3;
+                uint8_t sc = 0x7F;
+                if (tid == 0 && row_lo_valid) {
+                    sc = frag_lo.scale[((row_lo & 7) * 4) + (row_lo >> 3)];
+                } else if (tid == 1 && row_hi_valid) {
+                    sc = frag_hi.scale[((row_hi & 7) * 4) + (row_hi >> 3)];
+                }
+	                a_scale = uint32_t(sc);
+	            }
+	        }
+
+	        const int * Bxi = (const int *) B.x;
+	        float *     Dxi = (float *) D.x;
+
+	        asm volatile(
+	            "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m3.e2m3.f32.ue8m0 "
+	            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+	            "{%10}, {0, 0}, {%11}, {0, 0};"
+	            : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
+	            : "r"(A0), "r"(A1), "r"(A2), "r"(A3),
+	              "r"(Bxi[0]), "r"(Bxi[1]), "r"(a_scale), "r"(b_scale));
+	#else
+	        GGML_UNUSED_VARS(D, A, blocks_per_row, row_base, frag_abs, row_max, B, b_scale);
+	#endif // BLACKWELL_MMA_AVAILABLE
+	    }
+
+	    static __device__ __forceinline__ void mma_block_scaled_mxfp6_e2m3_fp8_e4m3(tile<16, 8, float> &     D,
+	                                                                                  const tile<16, 8, int> & A,
+	                                                                                  const tile<8, 8, int> &  B,
+	                                                                                  uint32_t                 a_scale,
+	                                                                                  uint32_t                 b_scale) {
+	#ifdef BLACKWELL_MMA_AVAILABLE
+	        const int * Axi = (const int *) A.x;
+	        const int * Bxi = (const int *) B.x;
+	        float *     Dxi = (float *) D.x;
+
+	        asm volatile(
+	            "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m3.e4m3.f32.ue8m0 "
+	            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+	            "{%10}, {0, 0}, {%11}, {0, 0};"
+	            : "+f"(Dxi[0]), "+f"(Dxi[1]), "+f"(Dxi[2]), "+f"(Dxi[3])
+	            : "r"(Axi[0]), "r"(Axi[1]), "r"(Axi[2]), "r"(Axi[3]),
+	              "r"(Bxi[0]), "r"(Bxi[1]), "r"(a_scale), "r"(b_scale));
+	#else
+	        GGML_UNUSED_VARS(D, A, B, a_scale, b_scale);
+	#endif // BLACKWELL_MMA_AVAILABLE
+	    }
+
+	    static __device__ __forceinline__ void mma(
+	            tile<16, 8, float> & D, const tile<16, 8, half2> & A, const tile<8, 8, half2> & B) {
 #ifdef TURING_MMA_AVAILABLE
         const int * Axi = (const int *) A.x;
         const int * Bxi = (const int *) B.x;

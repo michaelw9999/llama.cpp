@@ -40,6 +40,33 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+#ifndef GGML_HD
+#define GGML_HD __host__ __device__
+#endif // GGML_HD
+
+#define QK_FP8 96
+#define QK_FP8_SUB 32
+#define QK_FP8_FRAGS (QK_FP8 / QK_FP8_SUB)
+
+struct block_fp8 {
+    uint32_t qs[QK_FP8_FRAGS][QK_FP8_SUB / 4];
+    uint8_t  e[QK_FP8_FRAGS];
+    uint8_t  pad[1];
+};
+static_assert(sizeof(block_fp8) % 4 == 0, "wrong CUDA FP8 activation block alignment");
+
+static inline GGML_HD int64_t ggml_cuda_fp8_blocks_per_row(int64_t ne0) {
+    return (ne0 + QK_FP8 - 1) / QK_FP8;
+}
+
+static inline GGML_HD uint32_t ggml_cuda_fp8_get4_u8containers(const block_fp8 & block, int frag, int word) {
+    return block.qs[frag][word];
+}
+
+static inline GGML_HD void ggml_cuda_fp8_set4_u8containers(block_fp8 & block, int frag, int word, uint32_t packed4) {
+    block.qs[frag][word] = packed4;
+}
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -230,11 +257,11 @@ static const char * cu_get_error_str(CUresult err) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
         do {                                                                                                   \
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
+            static size_t shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { 0 };                           \
             const int   id                                                = ggml_cuda_get_device();            \
-            if (!shared_memory_limit_raised[id]) {                                                             \
+            if ((size_t) (nbytes) > shared_memory_limit_raised[id]) {                                           \
                 CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
-                shared_memory_limit_raised[id] = true;                                                         \
+                shared_memory_limit_raised[id] = nbytes;                                                       \
             }                                                                                                  \
         } while (0)
 #else
@@ -283,9 +310,18 @@ static const char * cu_get_error_str(CUresult err) {
 #define AMPERE_MMA_AVAILABLE
 #endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 
-#if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && \
+        (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL && __CUDA_ARCH__ < GGML_CUDA_CC_RUBIN))
 #    define BLACKWELL_MMA_AVAILABLE
-#endif // !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_BLACKWELL
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && BLACKWELL <= __CUDA_ARCH__ < RUBIN
+
+#define QK_MXFP6_E2M3 QK_MXFP6_SUB
+#define QR_MXFP6_E2M3 1
+#define QI_MXFP6_E2M3 (QK_MXFP6_E2M3 / (4 * QR_MXFP6_E2M3))
+
+// The tile layout types and host helpers are needed while nvcc parses every architecture pass.
+// Blackwell-only device code remains guarded at its use sites.
+#include "mma-tiles.cuh"
 
 #if !defined(GGML_USE_HIP) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
 #define CP_ASYNC_AVAILABLE
@@ -1025,6 +1061,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
     static constexpr int qi = QI_MXFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP6_E2M3> {
+    static constexpr int qk = QK_MXFP6_E2M3;
+    static constexpr int qr = QR_MXFP6_E2M3;
+    static constexpr int qi = QI_MXFP6_E2M3;
 };
 
 template<>
