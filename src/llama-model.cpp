@@ -1424,6 +1424,86 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+
+    auto use_cuda_native_nvfp4 = [](ggml_backend_dev_t dev) {
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            return false;
+        }
+
+        using cuda_dev_supports_native_nvfp4_t = bool (*)(ggml_backend_dev_t);
+        auto * supports_native_nvfp4 = (cuda_dev_supports_native_nvfp4_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_supports_native_nvfp4");
+        return supports_native_nvfp4 != nullptr && supports_native_nvfp4(dev);
+    };
+
+    auto visit_nvfp4_weights = [&](auto && fn) {
+        for (auto & layer : layers) {
+            fn(layer.wq);
+            fn(layer.wk);
+            fn(layer.wv);
+            fn(layer.wo);
+            fn(layer.wqkv);
+            fn(layer.wqkv_gate);
+            fn(layer.ffn_gate);
+            fn(layer.ffn_down);
+            fn(layer.ffn_up);
+            fn(layer.ffn_gate_exps);
+            fn(layer.ffn_down_exps);
+            fn(layer.ffn_up_exps);
+            fn(layer.ffn_gate_shexp);
+            fn(layer.ffn_down_shexp);
+            fn(layer.ffn_up_shexp);
+            fn(layer.ssm_in);
+            fn(layer.ssm_out);
+            fn(layer.ssm_alpha);
+            fn(layer.ssm_beta);
+            fn(layer.nextn.eh_proj);
+            fn(layer.nextn.shared_head_head);
+        }
+        fn(output);
+    };
+
+    auto attach_nvfp4_scales = [](ggml_tensor * weight, ggml_tensor *& weight_scale, ggml_tensor * input_scale, bool use_native_scales) {
+        if (weight == nullptr || weight->type != GGML_TYPE_NVFP4) {
+            return;
+        }
+
+        GGML_ASSERT(weight_scale != nullptr && "NVFP4 weight scale is missing.");
+        weight->src[0] = weight_scale;
+        weight->src[1] = input_scale;
+        if (use_native_scales) {
+            weight_scale = nullptr;
+        }
+    };
+
+    for (int il = 0; il < n_layer; ++il) {
+        auto & layer = layers[il];
+        const bool use_native_scales = use_cuda_native_nvfp4(pimpl->dev_layer[il].dev);
+        attach_nvfp4_scales(layer.wq,                     layer.wq_s,                     layer.wq_in_s,                     use_native_scales);
+        attach_nvfp4_scales(layer.wk,                     layer.wk_s,                     layer.wk_in_s,                     use_native_scales);
+        attach_nvfp4_scales(layer.wv,                     layer.wv_s,                     layer.wv_in_s,                     use_native_scales);
+        attach_nvfp4_scales(layer.wo,                     layer.wo_s,                     layer.wo_in_s,                     use_native_scales);
+        attach_nvfp4_scales(layer.wqkv,                   layer.wqkv_s,                   layer.wqkv_in_s,                   use_native_scales);
+        attach_nvfp4_scales(layer.wqkv_gate,              layer.wqkv_gate_s,              layer.wqkv_gate_in_s,              use_native_scales);
+        attach_nvfp4_scales(layer.ffn_gate,               layer.ffn_gate_s,               layer.ffn_gate_in_s,               use_native_scales);
+        attach_nvfp4_scales(layer.ffn_down,               layer.ffn_down_s,               layer.ffn_down_in_s,               use_native_scales);
+        attach_nvfp4_scales(layer.ffn_up,                 layer.ffn_up_s,                 layer.ffn_up_in_s,                 use_native_scales);
+        attach_nvfp4_scales(layer.ffn_gate_exps,          layer.ffn_gate_exps_s,          layer.ffn_gate_exps_in_s,          use_native_scales);
+        attach_nvfp4_scales(layer.ffn_down_exps,          layer.ffn_down_exps_s,          layer.ffn_down_exps_in_s,          use_native_scales);
+        attach_nvfp4_scales(layer.ffn_up_exps,            layer.ffn_up_exps_s,            layer.ffn_up_exps_in_s,            use_native_scales);
+        attach_nvfp4_scales(layer.ffn_gate_shexp,         layer.ffn_gate_shexp_s,         layer.ffn_gate_shexp_in_s,         use_native_scales);
+        attach_nvfp4_scales(layer.ffn_down_shexp,         layer.ffn_down_shexp_s,         layer.ffn_down_shexp_in_s,         use_native_scales);
+        attach_nvfp4_scales(layer.ffn_up_shexp,           layer.ffn_up_shexp_s,           layer.ffn_up_shexp_in_s,           use_native_scales);
+        attach_nvfp4_scales(layer.ssm_in,                 layer.ssm_in_s,                 layer.ssm_in_in_s,                 use_native_scales);
+        attach_nvfp4_scales(layer.ssm_out,                layer.ssm_out_s,                layer.ssm_out_in_s,                use_native_scales);
+        attach_nvfp4_scales(layer.ssm_alpha,              layer.ssm_alpha_s,              layer.ssm_alpha_in_s,              use_native_scales);
+        attach_nvfp4_scales(layer.ssm_beta,               layer.ssm_beta_s,               layer.ssm_beta_in_s,               use_native_scales);
+        attach_nvfp4_scales(layer.nextn.eh_proj,          layer.nextn.eh_proj_s,          layer.nextn.eh_proj_in_s,          use_native_scales);
+        attach_nvfp4_scales(layer.nextn.shared_head_head, layer.nextn.shared_head_head_s, layer.nextn.shared_head_head_in_s, use_native_scales);
+    }
+    attach_nvfp4_scales(output, output_s, output_in_s, use_cuda_native_nvfp4(pimpl->dev_output.dev));
+
     ml.done_getting_tensors();
 
     GGML_ASSERT(!(output && tok_embd &&
@@ -1564,6 +1644,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+
+    using patch_nvfp4_tensor_header_t = void (*)(ggml_tensor *);
+    auto patch_nvfp4_tensor_header = [](ggml_tensor * weight) {
+        if (weight == nullptr || weight->type != GGML_TYPE_NVFP4 || weight->buffer == nullptr) {
+            return;
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(weight->buffer));
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            return;
+        }
+
+        auto * patch_fn = (patch_nvfp4_tensor_header_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_patch_nvfp4_tensor_header");
+        if (patch_fn != nullptr) {
+            patch_fn(weight);
+        }
+    };
+
+    visit_nvfp4_weights([&](ggml_tensor * weight) {
+        patch_nvfp4_tensor_header(weight);
+    });
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
