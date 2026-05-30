@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <unordered_set>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1514,10 +1515,71 @@ bool llama_model_loader::load_all_data(
             ggml_backend_name(upload_backend));
     }
 
+    std::unordered_set<ggml_tensor *> loaded_early;
+    auto is_native_scale_tensor = [](const ggml_tensor * cur) {
+        if (cur == nullptr || cur->type != GGML_TYPE_F32 || !ggml_is_scalar(cur)) {
+            return false;
+        }
+
+        const char * name = ggml_get_name(cur);
+        return strstr(name, ".scale") != nullptr || strstr(name, ".input_scale") != nullptr;
+    };
+
+    for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+        if (!is_native_scale_tensor(cur)) {
+            continue;
+        }
+
+        const auto * weight = get_weight(ggml_get_name(cur));
+        if (weight == nullptr) {
+            continue;
+        }
+
+        const size_t n_size = ggml_nbytes(cur);
+        if (use_mmap) {
+            const auto & mapping = mappings.at(weight->idx);
+            ggml_backend_buffer_t buf_mmap = nullptr;
+            if (bufs.count(weight->idx)) {
+                buf_mmap = bufs.at(weight->idx);
+            }
+            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+
+            if (buf_mmap && cur->data == nullptr) {
+                ggml_backend_tensor_alloc(buf_mmap, cur, data);
+                if (lmlocks) {
+                    const auto & lmlock = lmlocks->at(weight->idx);
+                    lmlock->grow_to(weight->offs + n_size);
+                }
+
+                auto & mmap_used = mmaps_used[weight->idx];
+                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+            } else {
+                ggml_backend_tensor_set(cur, data, 0, n_size);
+            }
+        } else {
+            const auto & file = files.at(weight->idx);
+            read_buf.resize(n_size);
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(read_buf.data(), n_size);
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+            if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+        }
+
+        loaded_early.insert(cur);
+        size_done += n_size;
+    }
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
+            continue;
+        }
+
+        if (loaded_early.count(cur) != 0) {
             continue;
         }
 
@@ -1571,6 +1633,18 @@ bool llama_model_loader::load_all_data(
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
                 if (upload_backend) {
+                    if (cur->type == GGML_TYPE_NVFP4) {
+                        read_buf.resize(n_size);
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(read_buf.data(), n_size);
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
+                        size_done += n_size;
+                        continue;
+                    }
+
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);

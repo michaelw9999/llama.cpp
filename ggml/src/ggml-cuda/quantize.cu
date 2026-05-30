@@ -334,7 +334,123 @@ static __global__ void quantize_mmq_nvfp4(
     GGML_UNUSED_VARS(x, ids, vy, scale, ne00, s01, s02, s03, ne0, ne1, ne2, n_expert_used);
     NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
+}
 
+template <bool has_ids, bool has_scale>
+static __global__ void quantize_repacked_mmq_nvfp4(const float * __restrict__ x,
+                                                   const int32_t * __restrict__ ids,
+                                                   const int32_t * __restrict__ ids_expert,
+                                                   void * __restrict__ vy,
+                                                   const float * __restrict__ scale_activation,
+                                                   const int64_t scale_activation_ne,
+                                                   const int64_t ne00,
+                                                   const int64_t s01,
+                                                   const int64_t s02,
+                                                   const int64_t s03,
+                                                   const int64_t ne0,
+                                                   const int64_t ne1,
+                                                   const int64_t ne2) {
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const int64_t i0_base = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * QK_NVFP4_SUB;
+    if (i0_base >= ne0) {
+        return;
+    }
+
+    const int64_t i1 = blockIdx.x;
+    const int64_t i2 = blockIdx.z % ne2;
+    const int64_t i3 = blockIdx.z / ne2;
+    const int64_t i01 = has_ids ? ids[i1] : i1;
+    float inv_input_scale = 1.0f;
+    if constexpr (has_scale) {
+        const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : (has_ids && ids_expert ? ids_expert[i1] : i01);
+        float input_scale = scale_activation[scale_idx];
+        if (!(input_scale > 0.0f) || !isfinite(input_scale)) {
+            input_scale = 1.0f;
+        }
+        inv_input_scale = 1.0f / input_scale;
+    }
+
+    const int64_t k_block = i0_base / QK_FP4_MMQ;
+    const int64_t blocks_per_col = (ne0 + QK_FP4_MMQ - 1) / QK_FP4_MMQ;
+    if (k_block >= blocks_per_col) {
+        return;
+    }
+
+    const int64_t batch_offset = (int64_t) blockIdx.z * (blocks_per_col * ne1);
+    block_nvfp4_mmq * yb = (block_nvfp4_mmq *) vy + batch_offset + k_block * ne1 + blockIdx.x;
+    const int sub = (i0_base % QK_FP4_MMQ) / QK_NVFP4_SUB;
+
+    float vals0[8];
+    float vals1[8];
+    float sub_max = 0.0f;
+    const int64_t base_idx = i3 * s03 + i2 * s02 + i01 * s01;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int64_t i00 = i0_base + k;
+        const float v = i00 < ne00 ? x[base_idx + i00] * inv_input_scale : 0.0f;
+        vals0[k] = v;
+        sub_max = fmaxf(sub_max, fabsf(v));
+    }
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int64_t i00 = i0_base + 8 + k;
+        const float v = i00 < ne00 ? x[base_idx + i00] * inv_input_scale : 0.0f;
+        vals1[k] = v;
+        sub_max = fmaxf(sub_max, fabsf(v));
+    }
+
+    static constexpr int test_offsets[5] = { 0, -1, 1, -2, 2 };
+    const int first_fp8_code = (int) ggml_cuda_fp32_to_ue4m3(sub_max * (1.0f / 6.0f));
+    const int max_fp8_code = 0x7E;
+
+    float best_err = 1e30f;
+    uint8_t fp8_code = 0;
+    float subblock_scale = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        const int test_code = first_fp8_code + test_offsets[i];
+        if (test_code < 0 || test_code > max_fp8_code) {
+            continue;
+        }
+
+        const float test_scale = ggml_cuda_ue4m3_to_fp32((uint8_t) test_code);
+        if (!(test_scale > 0.0f) || !isfinite(test_scale)) {
+            continue;
+        }
+
+        float cur_err = 0.0f;
+        const float test_inv_scale = 0.5f / test_scale;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const uint8_t q0 = ggml_cuda_float_to_fp4_e2m1(vals0[k], test_inv_scale);
+            const uint8_t q1 = ggml_cuda_float_to_fp4_e2m1(vals1[k], test_inv_scale);
+            const float err0 = fabsf(vals0[k]) - fabsf(kvalues_mxfp4[q0 & 0x7]) * test_scale;
+            const float err1 = fabsf(vals1[k]) - fabsf(kvalues_mxfp4[q1 & 0x7]) * test_scale;
+            cur_err += err0 * err0 + err1 * err1;
+        }
+
+        if (cur_err < best_err) {
+            best_err = cur_err;
+            fp8_code = (uint8_t) test_code;
+            subblock_scale = test_scale;
+        }
+    }
+
+    const float inv_scale = subblock_scale > 0.0f ? 0.5f / subblock_scale : 0.0f;
+    uint32_t packed_lo = 0;
+    uint32_t packed_hi = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        packed_lo |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals0[k], inv_scale) << (4 * k);
+        packed_hi |= (uint32_t) ggml_cuda_float_to_fp4_e2m1(vals1[k], inv_scale) << (4 * k);
+    }
+    yb->qs_u32[2 * sub + 0] = packed_lo;
+    yb->qs_u32[2 * sub + 1] = packed_hi;
+    reinterpret_cast<uint8_t *>(yb->sc4_u32)[sub] = fp8_code;
+#else
+    NO_DEVICE_CODE; // This is for Blackwell NVFP4 activations only.
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
 
 static __device__ __forceinline__ uint8_t mxfp6_e2m3_scale_code_from_amax(float amax) {
@@ -414,7 +530,7 @@ static __global__ void quantize_mmq_mxfp6_e2m3(const float * __restrict__ x,
         if (lane == 0) {
             const int64_t scale_idx = scale_activation_ne <= 1 ? 0 : (has_ids && ids_expert ? ids_expert[i1] : i01);
             const float input_scale = scale_activation[scale_idx];
-            if (input_scale != 1.0f && input_scale != 0.0f && isfinite(input_scale)) {
+            if (input_scale != 1.0f && input_scale > 0.0f && isfinite(input_scale)) {
                 inv_input_scale = 1.0f / input_scale;
             }
         }
@@ -808,6 +924,36 @@ void quantize_mmq_mxfp6_e2m3_cuda(
             x, ids, nullptr, vy, scale_activation, scale_activation_ne, ne00, s01, s02, s03, ne0, ne1, ne2);
     } else {
         quantize_mmq_mxfp6_e2m3<false, false><<<num_blocks, block_size, 0, stream>>>(
+            x, ids, nullptr, vy, nullptr, 0, ne00, s01, s02, s03, ne0, ne1, ne2);
+    }
+}
+
+void quantize_mmq_nvfp4_cuda(
+        const float * x, const int32_t * ids, const int32_t * ids_expert, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
+        const float * scale_activation, const int64_t scale_activation_ne, cudaStream_t stream) {
+    GGML_ASSERT(type_src0 == GGML_TYPE_NVFP4);
+    GGML_ASSERT(ne0 > 0);
+    GGML_ASSERT(ne00 % QK_NVFP4 == 0);
+
+    constexpr int nvfp4_block_size = 128;
+    const int64_t block_num_y = (ne0 + QK_NVFP4_SUB * nvfp4_block_size - 1) / (QK_NVFP4_SUB * nvfp4_block_size);
+    const dim3 block_size(nvfp4_block_size, 1, 1);
+    const dim3 num_blocks(ne1, block_num_y, ne2 * ne3);
+    if (ids) {
+        if (scale_activation) {
+            quantize_repacked_mmq_nvfp4<true, true><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, ids_expert, vy, scale_activation, scale_activation_ne, ne00, s01, s02, s03, ne0, ne1, ne2);
+        } else {
+            quantize_repacked_mmq_nvfp4<true, false><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, ids_expert, vy, nullptr, 0, ne00, s01, s02, s03, ne0, ne1, ne2);
+        }
+    } else if (scale_activation) {
+        quantize_repacked_mmq_nvfp4<false, true><<<num_blocks, block_size, 0, stream>>>(
+            x, ids, nullptr, vy, scale_activation, scale_activation_ne, ne00, s01, s02, s03, ne0, ne1, ne2);
+    } else {
+        quantize_repacked_mmq_nvfp4<false, false><<<num_blocks, block_size, 0, stream>>>(
             x, ids, nullptr, vy, nullptr, 0, ne00, s01, s02, s03, ne0, ne1, ne2);
     }
 }

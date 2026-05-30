@@ -386,8 +386,10 @@ static __device__ __forceinline__ float vec_dot_mxfp6_e2m3_q8_1(
 
 #define VDR_NVFP4_Q8_1_MMVQ 2
 #define VDR_NVFP4_Q8_1_MMQ  8
+#define VDR_NVFP4_NVFP4_MMQ 4
 
-static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
+template <int vdr>
+static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_impl(
                                         const void * __restrict__ vbq,
                                         const block_q8_1 * __restrict__ bq8_1,
                                         const int32_t & kbx,
@@ -396,7 +398,7 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
     const block_nvfp4 * bq4 = (const block_nvfp4 *) vbq + kbx;
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < VDR_NVFP4_Q8_1_MMVQ/2; i++) {
+    for (int i = 0; i < vdr/2; i++) {
         const int32_t iqs0 = iqs + 2*i;
         const int32_t iqs1 = iqs0 + 1;
         const int32_t is = iqs0 >> 1;
@@ -416,6 +418,64 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
 
     return sum;
 }
+
+#if defined(BLACKWELL_MMA_AVAILABLE)
+static __device__ __forceinline__ int get_int_from_table_16_contiguous4(const uint32_t q4, const int8_t * table) {
+    const uint32_t * table32 = (const uint32_t *) table;
+    const uint32_t low  = __byte_perm(table32[0], table32[1], q4);
+    const uint32_t high = __byte_perm(table32[2], table32[3], q4);
+    return __byte_perm(low, high, 0x3210u | ((q4 & 0x8888u) >> 1));
+}
+
+static __device__ __forceinline__ float vec_dot_nvfp4_q8_1_bw(
+                                        const void * __restrict__ vbq,
+                                        const block_q8_1 * __restrict__ bq8_1,
+                                        const uint64_t kbx,
+                                        const int32_t & iqs,
+                                        const uint32_t channel_x) {
+    const int row_in_tile = int(kbx >> 60);
+    const int frag = int((kbx >> 58) & 0x03);
+    const uint64_t block_rel = kbx & ((UINT64_C(1) << 58) - 1);
+    const block_nvfp4_blackwell_tensor * tensor = (const block_nvfp4_blackwell_tensor *) vbq;
+    const block_nvfp4_blackwell & tile = tensor->tiles[block_rel];
+    const block_nvfp4_blackwell_frag & frag_tile = tile.tiles[frag];
+    const int lane_base = (row_in_tile & 7) * 4;
+    const int reg_base  = row_in_tile >> 3;
+    const uint32_t scale_word = frag_tile.scales_u32[lane_base + reg_base];
+    float tensor_scale = tensor->weight_scales ? tensor->weight_scales[channel_x] : tensor->weight_scale;
+    tensor_scale = tensor_scale > 0.0f ? tensor_scale : 1.0f;
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < VDR_NVFP4_Q8_1_MMVQ/2; i++) {
+        const int32_t iqs0 = iqs + 2*i;
+        const int32_t is = iqs0 >> 1;
+        const int32_t sub = is & 3;
+        const int lane = lane_base + 2*(sub & 1);
+        const int reg  = reg_base + 2*(sub >> 1);
+        const uint32_t q_lo = frag_tile.regs[lane + 0][reg];
+        const uint32_t q_hi = frag_tile.regs[lane + 1][reg];
+        const int x0 = get_int_from_table_16_contiguous4(q_lo & 0xFFFFu, kvalues_mxfp4);
+        const int x1 = get_int_from_table_16_contiguous4(q_lo >> 16, kvalues_mxfp4);
+        const int x2 = get_int_from_table_16_contiguous4(q_hi & 0xFFFFu, kvalues_mxfp4);
+        const int x3 = get_int_from_table_16_contiguous4(q_hi >> 16, kvalues_mxfp4);
+        const block_q8_1 * bq8 = bq8_1 + (is >> 1);
+        const int32_t i8 = ((is & 1) << 2);
+
+        int sumi = ggml_cuda_dp4a(x0, get_int_b4(bq8->qs, i8 + 0), 0);
+        sumi = ggml_cuda_dp4a(x2, get_int_b4(bq8->qs, i8 + 2), sumi);
+        sumi = ggml_cuda_dp4a(x1, get_int_b4(bq8->qs, i8 + 1), sumi);
+        sumi = ggml_cuda_dp4a(x3, get_int_b4(bq8->qs, i8 + 3), sumi);
+
+        const float d = tensor_scale *
+            ggml_cuda_ue4m3_to_fp32((scale_word >> (8*sub)) & 0xFF) *
+            __low2float(bq8->ds);
+        sum += d * float(sumi);
+    }
+
+    return sum;
+}
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
 
 #define VDR_Q2_K_Q8_1_MMVQ 1
 #define VDR_Q2_K_Q8_1_MMQ  4

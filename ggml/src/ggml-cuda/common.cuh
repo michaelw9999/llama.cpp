@@ -1709,3 +1709,26 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+static inline const ggml_tensor * ggml_cuda_mul_mat_input_scale(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * scale = src0 != nullptr ? src0->src[1] : nullptr;
+    if (scale != nullptr && scale->type != GGML_TYPE_F32) {
+        return nullptr;
+    }
+    if (scale != nullptr && strstr(ggml_get_name(scale), ".input_scale") == nullptr) {
+        return nullptr;
+    }
+    if (scale != nullptr && (!scale->data || !scale->buffer)) {
+        return nullptr;
+    }
+    if (scale != nullptr && scale->buffer != nullptr && ggml_backend_buffer_is_host(scale->buffer)) {
+        return nullptr;
+    }
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    if (scale != nullptr && ggml_is_scalar(scale) && src0->type == GGML_TYPE_NVFP4) {
+        return nullptr;
+    }
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
+    return scale;
+}

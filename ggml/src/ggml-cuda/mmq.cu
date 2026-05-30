@@ -132,7 +132,12 @@ void ggml_cuda_mul_mat_q(
 
     const bool fallback = ne01 % 128 != 0;
 
-    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    const bool use_native_fp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
+#if defined(BLACKWELL_MMA_AVAILABLE)
+    const bool use_native_nvfp4 = src0->type == GGML_TYPE_NVFP4;
+#else
+    const bool use_native_nvfp4 = false;
+#endif // defined(BLACKWELL_MMA_AVAILABLE)
     const bool use_mxfp6_mmq = blackwell_mma_available(cc) && ggml_is_contiguous(src0) && src0->view_src == nullptr &&
         src0->type == GGML_TYPE_MXFP6_E2M3 && ne00 % QK_MXFP6_E2M3 == 0;
 
@@ -142,10 +147,21 @@ void ggml_cuda_mul_mat_q(
     if (scale_x_q_d == nullptr && use_mxfp6_mmq) {
         scale_x_q_d = &((const tensor_mxfp6 *) src0_d)->input_scale;
     }
+    const ggml_tensor * nvfp4_scale_x_src = use_native_nvfp4 ? src0->src[1] : nullptr;
+    const float * nvfp4_scale_x_q_d = ggml_cuda_nvfp4_scale_ptr(nvfp4_scale_x_src);
+    const int64_t nvfp4_scale_x_q_ne = nvfp4_scale_x_q_d != nullptr ? ggml_nelements(nvfp4_scale_x_src) : (use_native_nvfp4 ? 1 : 0);
+    if (nvfp4_scale_x_q_d == nullptr && use_native_nvfp4) {
+        nvfp4_scale_x_q_d = &((const block_nvfp4_blackwell_tensor *) src0_d)->input_scale;
+    }
 
     int64_t s01_mmq = s01;
     int64_t s02_mmq = s02;
     int64_t s03_mmq = s03;
+    if (use_native_nvfp4) {
+        s01_mmq = ggml_cuda_nvfp4_blocks_per_row(ne00);
+        s02_mmq = ((ne01 + 15) / 16) * s01_mmq;
+        s03_mmq = (s03 / s02) * s02_mmq;
+    }
     if (use_mxfp6_mmq) {
         s01_mmq = ggml_cuda_mxfp6_e2m3_frags_per_row(ne00);
         s02_mmq = ((ne01 + MXFP6_TILE_ROWS - 1) / MXFP6_TILE_ROWS) * s01_mmq;
@@ -159,6 +175,8 @@ void ggml_cuda_mul_mat_q(
         const int J_max = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11);
         const size_t nbytes_src1_q8_1 = use_native_fp4 ?
             ne13*ne12 * ne11*ne10_padded * sizeof(block_fp4_mmq) / QK_FP4_MMQ + J_max*sizeof(block_fp4_mmq) :
+            use_native_nvfp4 ?
+            ne13*ne12 * ne11*ggml_cuda_nvfp4_blocks_per_row(ne10_padded) * sizeof(block_nvfp4_mmq) + J_max*sizeof(block_nvfp4_mmq) :
             use_mxfp6_mmq ?
             ne13*ne12 * ne11*ggml_cuda_mxfp6_e2m3_frags_per_row(ne10_padded) * sizeof(block_mxfp6_e2m3_mmq) + J_max*sizeof(block_mxfp6_e2m3_mmq) :
             ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + J_max*sizeof(block_q8_1_mmq);
@@ -178,7 +196,9 @@ void ggml_cuda_mul_mat_q(
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
-
+            } else if (use_native_nvfp4) {
+                quantize_mmq_nvfp4_cuda(src1_d, nullptr, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                        ne10_padded, ne11, ne12, ne13, nvfp4_scale_x_q_d, nvfp4_scale_x_q_ne, stream);
             } else if (use_mxfp6_mmq) {
                 quantize_mmq_mxfp6_e2m3_cuda(src1_d, nullptr, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                              ne10_padded, ne11, ne12, ne13, scale_x_q_d, scale_x_q_ne, stream);
@@ -192,6 +212,8 @@ void ggml_cuda_mul_mat_q(
         // Stride depends on quantization format
         const int64_t s12 = use_native_fp4 ?
                                 ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
+                            use_native_nvfp4 ?
+                                ne11 * ggml_cuda_nvfp4_blocks_per_row(ne10_padded) * sizeof(block_nvfp4_mmq) / sizeof(int) :
                             use_mxfp6_mmq ?
                                 ne11 * ggml_cuda_mxfp6_e2m3_frags_per_row(ne10_padded) * sizeof(block_mxfp6_e2m3_mmq) / sizeof(int) :
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
@@ -238,6 +260,8 @@ void ggml_cuda_mul_mat_q(
     const int J_max = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11);
     const size_t nbytes_src1_q8_1 = use_native_fp4 ?
         ne12*n_expert_used*ne10_padded * sizeof(block_fp4_mmq) / QK_FP4_MMQ + J_max*sizeof(block_fp4_mmq) :
+        use_native_nvfp4 ?
+        ne12*n_expert_used*ggml_cuda_nvfp4_blocks_per_row(ne10_padded) * sizeof(block_nvfp4_mmq) + J_max*sizeof(block_nvfp4_mmq) :
         use_mxfp6_mmq ?
         ne12*n_expert_used*ggml_cuda_mxfp6_e2m3_frags_per_row(ne10_padded) * sizeof(block_mxfp6_e2m3_mmq) + J_max*sizeof(block_mxfp6_e2m3_mmq) :
         ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + J_max*sizeof(block_q8_1_mmq);
@@ -266,6 +290,9 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
+        } else if (use_native_nvfp4) {
+            quantize_mmq_nvfp4_cuda(src1_d, ids_src1.get(), ids_expert.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, nvfp4_scale_x_q_d, nvfp4_scale_x_q_ne, stream);
         } else if (use_mxfp6_mmq) {
             quantize_mmq_mxfp6_e2m3_cuda(src1_d, ids_src1.get(), ids_expert.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                          ne10_padded, ne11_flat, ne12_flat, ne13_flat, scale_x_q_d, scale_x_q_ne, stream);
@@ -282,6 +309,8 @@ void ggml_cuda_mul_mat_q(
     static_assert(QK_FP4_MMQ == 8 * QK_MXFP4, "QK_FP4_MMQ needs to be 8 * QK_MXFP4");
     const int64_t s12 = use_native_fp4 ?
                             ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
+                        use_native_nvfp4 ?
+                            ne11_flat * ggml_cuda_nvfp4_blocks_per_row(ne10_padded) * sizeof(block_nvfp4_mmq) / sizeof(int) :
                         use_mxfp6_mmq ?
                             ne11_flat * ggml_cuda_mxfp6_e2m3_frags_per_row(ne10_padded) * sizeof(block_mxfp6_e2m3_mmq) / sizeof(int) :
                             ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
