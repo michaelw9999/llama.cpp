@@ -18,7 +18,6 @@ struct __align__(16) block_nvfp4_blackwell_tensor {
     float         input_scale;
     const float * weight_scales;
     const float * input_scales;
-    uint32_t      rows_offset16;
     block_nvfp4_blackwell tiles[];
 };
 
@@ -54,6 +53,12 @@ static inline uint32_t ggml_cuda_nvfp4_pack8(const uint8_t * p, int shift) {
         (((uint32_t) ((p[7] >> shift) & 0x0F)) << 28);
 }
 
+static inline void ggml_cuda_nvfp4_unpack8(uint32_t q_lo, uint32_t q_hi, uint8_t * p) {
+    for (int i = 0; i < 8; ++i) {
+        p[i] = (uint8_t) (((q_lo >> (4*i)) & 0x0Fu) | (((q_hi >> (4*i)) & 0x0Fu) << 4));
+    }
+}
+
 static inline __host__ __device__ int64_t ggml_cuda_nvfp4_blocks_per_row(int64_t ne0) {
     return (ne0 + QK_K - 1) / QK_K;
 }
@@ -72,8 +77,7 @@ static inline size_t ggml_cuda_nvfp4_tensor_packed_size(int64_t ne0, int64_t ne1
 }
 
 static inline size_t ggml_cuda_nvfp4_tensor_size(int64_t ne0, int64_t ne1, int64_t nplanes) {
-    return ggml_cuda_nvfp4_tensor_packed_size(ne0, ne1, nplanes) +
-           ggml_cuda_nvfp4_rows_size(ne0, ne1, nplanes);
+    return ggml_cuda_nvfp4_tensor_packed_size(ne0, ne1, nplanes);
 }
 
 static inline size_t ggml_cuda_nvfp4_tensor_alloc_size(const ggml_tensor * tensor) {
@@ -116,36 +120,12 @@ static inline void ggml_cuda_nvfp4_set_tensor_header(
         input_scale = 1.0f;
     }
 
-    const size_t rows_offset = tensor != nullptr ?
-        ggml_cuda_nvfp4_tensor_packed_size(tensor->ne[0], ne1, nplanes) : 0;
-    GGML_ASSERT(rows_offset % 16 == 0);
-    GGML_ASSERT(rows_offset / 16 <= UINT32_MAX);
-
     dst->weight_scale  = weight_scale;
     dst->input_scale   = input_scale;
     dst->weight_scales = ggml_cuda_nvfp4_scale_ptr(weight_scale_t);
     dst->input_scales  = ggml_cuda_nvfp4_scale_ptr(input_scale_t);
-    dst->rows_offset16 = (uint32_t) (rows_offset / 16);
-}
-
-static inline void ggml_cuda_nvfp4_patch_tensor_header(
-        const ggml_tensor * tensor, block_nvfp4_blackwell_tensor * dst, cudaStream_t stream) {
-    const ggml_tensor * weight_scale_t = tensor != nullptr ? tensor->src[0] : nullptr;
-    const ggml_tensor * input_scale_t  = tensor != nullptr ? tensor->src[1] : nullptr;
-
-    if (weight_scale_t != nullptr && ggml_is_scalar(weight_scale_t) &&
-            weight_scale_t->type == GGML_TYPE_F32 && weight_scale_t->data != nullptr) {
-        CUDA_CHECK(cudaMemcpyAsync(&dst->weight_scale, weight_scale_t->data, sizeof(float), cudaMemcpyDefault, stream));
-    }
-    if (input_scale_t != nullptr && ggml_is_scalar(input_scale_t) &&
-            input_scale_t->type == GGML_TYPE_F32 && input_scale_t->data != nullptr) {
-        CUDA_CHECK(cudaMemcpyAsync(&dst->input_scale, input_scale_t->data, sizeof(float), cudaMemcpyDefault, stream));
-    }
-
-    const float * weight_scales = ggml_cuda_nvfp4_scale_ptr(weight_scale_t);
-    const float * input_scales  = ggml_cuda_nvfp4_scale_ptr(input_scale_t);
-    CUDA_CHECK(cudaMemcpyAsync(&dst->weight_scales, &weight_scales, sizeof(weight_scales), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(&dst->input_scales,  &input_scales,  sizeof(input_scales),  cudaMemcpyHostToDevice, stream));
+    GGML_UNUSED(ne1);
+    GGML_UNUSED(nplanes);
 }
 
 static inline void ggml_cuda_repack_tiles_nvfp4(int64_t ne0, int64_t nrows, const void * src, void * dst) {
@@ -223,6 +203,63 @@ static inline void ggml_cuda_repack_tensor_nvfp4(const ggml_tensor * tensor, con
                 dst_tiles + plane * dst_plane_size);
     }
 
-    memcpy((char *) dst + ggml_cuda_nvfp4_tensor_packed_size(ne0, ne1, nplanes),
-            src, ggml_cuda_nvfp4_rows_size(ne0, ne1, nplanes));
+}
+
+static inline void ggml_cuda_unpack_tiles_nvfp4(int64_t ne0, int64_t nrows, const void * src, void * dst) {
+    GGML_ASSERT(ne0 % QK_NVFP4 == 0);
+
+    const int64_t src_blocks_per_row = ggml_cuda_nvfp4_blocks_per_row(ne0);
+    const int64_t dst_blocks_per_row = (ne0 + QK_NVFP4 - 1) / QK_NVFP4;
+    const int64_t tile_rows = (nrows + 15) / 16;
+    const size_t dst_row_size = ggml_row_size(GGML_TYPE_NVFP4, ne0);
+
+    const block_nvfp4_blackwell * src_blocks = (const block_nvfp4_blackwell *) src;
+    uint8_t * dst_bytes = (uint8_t *) dst;
+
+    for (int64_t tile_row = 0; tile_row < tile_rows; ++tile_row) {
+        const int64_t row0 = tile_row * 16;
+        const int rows_in_tile = (int) ((row0 + 16 <= nrows) ? 16 : (nrows - row0));
+
+        for (int64_t block_col = 0; block_col < src_blocks_per_row; ++block_col) {
+            const int64_t dst_block0 = block_col * 4;
+            const int frags_in_block = (int) ((dst_block0 + 4 <= dst_blocks_per_row) ? 4 : (dst_blocks_per_row - dst_block0));
+            const block_nvfp4_blackwell & in = src_blocks[tile_row * src_blocks_per_row + block_col];
+
+            for (int row_in_tile = 0; row_in_tile < rows_in_tile; ++row_in_tile) {
+                const int64_t row = row0 + row_in_tile;
+                block_nvfp4 * dst_row = (block_nvfp4 *) (dst_bytes + row * dst_row_size);
+                const int lane_base = (row_in_tile & 7) * 4;
+                const int row_half = row_in_tile >> 3;
+                const int scale_lane = lane_base + row_half;
+
+                for (int frag = 0; frag < frags_in_block; ++frag) {
+                    const block_nvfp4_blackwell_frag & tile = in.tiles[frag];
+                    block_nvfp4 & out = dst_row[dst_block0 + frag];
+
+                    ggml_cuda_nvfp4_unpack8(tile.regs[lane_base + 0][row_half + 0], tile.regs[lane_base + 1][row_half + 0], out.qs +  0);
+                    ggml_cuda_nvfp4_unpack8(tile.regs[lane_base + 2][row_half + 0], tile.regs[lane_base + 3][row_half + 0], out.qs +  8);
+                    ggml_cuda_nvfp4_unpack8(tile.regs[lane_base + 0][row_half + 2], tile.regs[lane_base + 1][row_half + 2], out.qs + 16);
+                    ggml_cuda_nvfp4_unpack8(tile.regs[lane_base + 2][row_half + 2], tile.regs[lane_base + 3][row_half + 2], out.qs + 24);
+
+                    uint32_t d = tile.scales_u32[scale_lane];
+                    memcpy(out.d, &d, sizeof(out.d));
+                }
+            }
+        }
+    }
+}
+
+static inline void ggml_cuda_unpack_tensor_nvfp4(const ggml_tensor * tensor, const void * src, void * dst) {
+    const int64_t ne0 = tensor->ne[0];
+    const int64_t ne1 = tensor->ne[1];
+    const int64_t nplanes = tensor->ne[2] * tensor->ne[3];
+    const size_t src_plane_size = ggml_cuda_nvfp4_plane_size(ne0, ne1);
+    const size_t dst_plane_size = ggml_row_size(GGML_TYPE_NVFP4, ne0) * ne1;
+    const block_nvfp4_blackwell_tensor * src_tensor = (const block_nvfp4_blackwell_tensor *) src;
+
+    for (int64_t plane = 0; plane < nplanes; ++plane) {
+        ggml_cuda_unpack_tiles_nvfp4(ne0, ne1,
+                (const char *) src_tensor->tiles + plane * src_plane_size,
+                (char *) dst + plane * dst_plane_size);
+    }
 }
