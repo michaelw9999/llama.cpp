@@ -1331,7 +1331,14 @@ class TextModel(ModelBase):
         toktypes: list[int] = []
 
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+        except ValueError as e:
+            if "Tokenizer class TokenizersBackend" not in str(e):
+                raise
+
+            from transformers import PreTrainedTokenizerFast
+            tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(self.dir_model / "tokenizer.json"))
         vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))  # ty: ignore[unresolved-attribute]
         assert max(tokenizer.vocab.values()) < vocab_size  # ty: ignore[unresolved-attribute]
 

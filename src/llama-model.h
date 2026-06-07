@@ -295,7 +295,7 @@ struct llama_layer {
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp      = nullptr;
-    struct ggml_tensor * ffn_gate_inp_s    = nullptr; // gemma4
+    struct ggml_tensor * ffn_gate_inp_s    = nullptr;
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
@@ -432,6 +432,7 @@ struct llama_layer {
     struct ggml_tensor * wo_in_s            = nullptr;
     struct ggml_tensor * wqkv_in_s          = nullptr;
     struct ggml_tensor * wqkv_gate_in_s     = nullptr;
+    struct ggml_tensor * ffn_gate_inp_in_s  = nullptr;
     struct ggml_tensor * ffn_gate_in_s      = nullptr;
     struct ggml_tensor * ffn_up_in_s        = nullptr;
     struct ggml_tensor * ffn_down_in_s      = nullptr;

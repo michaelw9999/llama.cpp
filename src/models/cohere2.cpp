@@ -30,6 +30,8 @@ void llama_model_cohere2::load_arch_tensors(llama_model_loader &) {
     // init output from the input tok embed
     output      = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab },
                                       TENSOR_DUPLICATED);
+    output_s    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "scale"),       { 1 }, TENSOR_NOT_REQUIRED);
+    output_in_s = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "input_scale"), { 1 }, TENSOR_NOT_REQUIRED);
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
@@ -68,6 +70,18 @@ llama_model_cohere2::graph::graph(const llama_model & model, const llm_graph_par
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    auto effective_scale = [this](ggml_tensor * s, ggml_tensor * in_s, const char * name, int il) {
+        if (s == nullptr) {
+            return in_s;
+        }
+        if (in_s == nullptr) {
+            return s;
+        }
+        ggml_tensor * cur = ggml_mul(ctx0, s, in_s);
+        cb(cur, name, il);
+        return cur;
+    };
+
     for (int il = 0; il < n_layer; ++il) {
         const bool is_swa = hparams.is_swa(il);
         // UNUSED:
@@ -85,7 +99,14 @@ llama_model_cohere2::graph::graph(const llama_model & model, const llm_graph_par
             ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
             // compute Q and K and RoPE them
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            llama_layer layer = model.layers[il];
+            layer.wq_s   = effective_scale(layer.wq_s,   layer.wq_in_s,   "attn_q_s",   il);
+            layer.wk_s   = effective_scale(layer.wk_s,   layer.wk_in_s,   "attn_k_s",   il);
+            layer.wv_s   = effective_scale(layer.wv_s,   layer.wv_in_s,   "attn_v_s",   il);
+            layer.wqkv_s = effective_scale(layer.wqkv_s, layer.wqkv_in_s, "attn_qkv_s", il);
+            layer.wo_s   = effective_scale(layer.wo_s,   layer.wo_in_s,   "attn_out_s", il);
+
+            auto [Qcur, Kcur, Vcur] = build_qkv(layer, cur,
                     n_embd_head, n_head, n_head_kv, il);
 
             if (is_swa) {
@@ -107,7 +128,7 @@ llama_model_cohere2::graph::graph(const llama_model & model, const llm_graph_par
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    layer.wo, layer.wo_b, layer.wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
 
@@ -121,10 +142,11 @@ llama_model_cohere2::graph::graph(const llama_model & model, const llm_graph_par
 
         // feed-forward network
         {
+            const auto & layer = model.layers[il];
             cur = build_ffn(ffn_inp,
-                    model.layers[il].ffn_up, NULL, NULL,
-                    model.layers[il].ffn_gate, NULL, NULL,
-                    model.layers[il].ffn_down, NULL, NULL,
+                    layer.ffn_up, NULL, effective_scale(layer.ffn_up_s, layer.ffn_up_in_s, "ffn_up_s", il),
+                    layer.ffn_gate, NULL, effective_scale(layer.ffn_gate_s, layer.ffn_gate_in_s, "ffn_gate_s", il),
+                    layer.ffn_down, NULL, effective_scale(layer.ffn_down_s, layer.ffn_down_in_s, "ffn_down_s", il),
                     NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
         }
@@ -148,7 +170,7 @@ llama_model_cohere2::graph::graph(const llama_model & model, const llm_graph_par
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, effective_scale(model.output_s, model.output_in_s, "output_s", -1));
 
     if (f_logit_scale) {
         cur = ggml_scale(ctx0, cur, f_logit_scale);
