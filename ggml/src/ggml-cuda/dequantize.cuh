@@ -450,3 +450,13 @@ static __device__ __forceinline__ void dequantize_mxfp4(const void * vx, const i
         y[j+16] = ggml_cuda_cast<dst_t>(d * kvalues_mxfp4[q4[j] >>  4]*0.5f);
     }
 }
+
+static __device__ __forceinline__ void dequantize_mxfp8(
+        const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_mxfp8 * x = (const block_mxfp8 *) vx;
+    const int frag = iqs / QK_MXFP8_SUB;
+    const float d = ggml_cuda_e8m0_to_fp32(x[ib].e[frag]);
+
+    v.x = d * ggml_cuda_e4m3_to_fp32(x[ib].qs[frag][iqs % QK_MXFP8_SUB + 0]);
+    v.y = d * ggml_cuda_e4m3_to_fp32(x[ib].qs[frag][iqs % QK_MXFP8_SUB + 1]);
+}

@@ -293,6 +293,60 @@ static void get_rows_cuda_float(
 }
 
 template <typename dst_t>
+static __global__ void k_get_rows_mxfp8_tiled(
+        const mxfp8_tile * __restrict__ src0, const int32_t * __restrict__ src1,
+        dst_t * __restrict__ dst, const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t s10, const size_t s11, const size_t s12) {
+    const int64_t bpr             = ggml_cuda_mxfp8_blocks_per_row(ne00);
+    const int64_t tiles_per_plane = ggml_cuda_mxfp8_tile_rows(ne01) * bpr;
+
+    for (int64_t z = blockIdx.z; z < ne11 * (int64_t) ne12_fdv.z; z += gridDim.z) {
+        for (int64_t i00 = blockIdx.y * blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y * blockDim.x) {
+            const int i10 = blockIdx.x;
+            const uint2 dm = fast_div_modulo((uint32_t) z, ne12_fdv);
+            const int i11 = dm.x;
+            const int i12 = dm.y;
+            const int i01 = src1[i10 * s10 + i11 * s11 + i12 * s12];
+            const int64_t plane = i12 * ne02 + i11;
+            const int64_t block = i00 / QK_MXFP8;
+            const int elem      = i00 % QK_MXFP8;
+            const int frag      = elem / QK_MXFP8_SUB;
+            const int elem_frag = elem % QK_MXFP8_SUB;
+            const int row       = i01 % MXFP8_MMA_TILE_ROWS;
+
+            const mxfp8_tile & tile = src0[plane * tiles_per_plane +
+                (i01 / MXFP8_MMA_TILE_ROWS) * bpr + block];
+            const uint4 packed = tile.qs[frag][ggml_cuda_mxfp8_frag_lane(row, elem_frag / 4)];
+            const int reg = ggml_cuda_mxfp8_frag_reg(row, elem_frag / 4);
+            const uint32_t word = reg == 0 ? packed.x : (reg == 1 ? packed.y : (reg == 2 ? packed.z : packed.w));
+            const uint8_t q = uint8_t(word >> (8 * (elem_frag & 3)));
+            const float d = ggml_cuda_e8m0_to_fp32(tile.sc[frag][row]);
+            dst_t * dst_row = dst + i10 * s1 + i11 * s2 + i12 * s3;
+            dst_row[i00] = ggml_cuda_cast<dst_t>(d * ggml_cuda_e4m3_to_fp32(q));
+        }
+    }
+}
+
+template <typename dst_t>
+static void get_rows_cuda_mxfp8_tiled(
+        const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const int64_t ne10, const int64_t ne11, const int64_t ne12,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3, cudaStream_t stream) {
+    const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
+    const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
+    const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11 * ne12, UINT16_MAX));
+    const uint3 ne12_fdv = init_fastdiv_values(ne12);
+    k_get_rows_mxfp8_tiled<<<block_nums, block_dims, 0, stream>>>(
+        (const mxfp8_tile *) src0_d, src1_d, dst_d, ne00, ne01, ne02, ne11, ne12_fdv,
+        nb1 / sizeof(dst_t), nb2 / sizeof(dst_t), nb3 / sizeof(dst_t),
+        nb10 / sizeof(int32_t), nb11 / sizeof(int32_t), nb12 / sizeof(int32_t));
+}
+
+template <typename dst_t>
 static void ggml_cuda_get_rows_switch_src0_type(
         const void * src0_d, const ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
         const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
@@ -404,6 +458,14 @@ static void ggml_cuda_get_rows_switch_src0_type(
             get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
                 ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
+        case GGML_TYPE_MXFP8: {
+            // weights uploaded through set_tensor are stored permuted, embeddings included
+            const int64_t ne01_g = nb01 ? (int64_t) (nb02 / nb01) : 0;
+            const int64_t ne02_g = nb02 ? (int64_t) (nb03 / nb02) : 1;
+            get_rows_cuda_mxfp8_tiled(src0_d, src1_d, dst_d,
+                ne00, ne01_g, ne02_g, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            break;
+        }
         default:
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
             break;
