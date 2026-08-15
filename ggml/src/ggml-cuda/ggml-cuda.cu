@@ -783,10 +783,116 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// Permute MXFP8 weights into the m16n8k32 A-fragment order once, when the tensor is uploaded.
+// Codes and scales go to separate planes and the last 16-row tile is padded, so every MXFP8
+// weight ends up in the same layout regardless of its row count.
+static __global__ void ggml_cuda_repack_mxfp8_tiles(
+        const block_mxfp8 * __restrict__ src, mxfp8_tile * __restrict__ dst,
+        const int64_t blocks_per_row, const int64_t tile_rows, const int64_t ne1) {
+    const int     lane = int(threadIdx.x);
+    const int     frag = int(threadIdx.y);
+    const int64_t tile = int64_t(blockIdx.x);
+
+    const int64_t tiles_per_plane = tile_rows * blocks_per_row;
+    const int64_t plane     = tile / tiles_per_plane;
+    const int64_t in_plane  = tile - plane * tiles_per_plane;
+    const int64_t tile_row  = in_plane / blocks_per_row;
+    const int64_t block_col = in_plane - tile_row * blocks_per_row;
+
+    const int row_lo = lane >> 2;
+    const int row_hi = row_lo + 8;
+    const int word   = lane & 3;
+    const int64_t row0 = tile_row * MXFP8_MMA_TILE_ROWS;
+
+    const block_mxfp8 * rows = src + plane * ne1 * blocks_per_row + row0 * blocks_per_row + block_col;
+
+    uint4 packed = make_uint4(0, 0, 0, 0);
+    if (row0 + row_lo < ne1) {
+        const uint32_t * q = reinterpret_cast<const uint32_t *>(rows[row_lo * blocks_per_row].qs[frag]);
+        packed.x = q[word + 0];
+        packed.z = q[word + 4];
+    }
+    if (row0 + row_hi < ne1) {
+        const uint32_t * q = reinterpret_cast<const uint32_t *>(rows[row_hi * blocks_per_row].qs[frag]);
+        packed.y = q[word + 0];
+        packed.w = q[word + 4];
+    }
+    dst[tile].qs[frag][lane] = packed;
+
+    if (lane < MXFP8_MMA_TILE_ROWS) {
+        // padded rows carry zero codes, so their scale only has to be a legal e8m0
+        dst[tile].sc[frag][lane] = row0 + lane < ne1 ? rows[lane * blocks_per_row].e[frag] : 0x7F;
+    }
+}
+
+// inverse permutation, so a repacked weight can still be read back in serialized form
+static __global__ void ggml_cuda_unpack_mxfp8_tiles(
+        const mxfp8_tile * __restrict__ src, block_mxfp8 * __restrict__ dst,
+        const int64_t blocks_per_row, const int64_t tile_rows, const int64_t ne1) {
+    const int     lane = int(threadIdx.x);
+    const int     frag = int(threadIdx.y);
+    const int64_t tile = int64_t(blockIdx.x);
+
+    const int64_t tiles_per_plane = tile_rows * blocks_per_row;
+    const int64_t plane     = tile / tiles_per_plane;
+    const int64_t in_plane  = tile - plane * tiles_per_plane;
+    const int64_t tile_row  = in_plane / blocks_per_row;
+    const int64_t block_col = in_plane - tile_row * blocks_per_row;
+
+    const int row_lo = lane >> 2;
+    const int row_hi = row_lo + 8;
+    const int word   = lane & 3;
+    const int64_t row0 = tile_row * MXFP8_MMA_TILE_ROWS;
+
+    block_mxfp8 * rows = dst + plane * ne1 * blocks_per_row + row0 * blocks_per_row + block_col;
+    const uint4 packed = src[tile].qs[frag][lane];
+
+    if (row0 + row_lo < ne1) {
+        uint32_t * q = reinterpret_cast<uint32_t *>(rows[row_lo * blocks_per_row].qs[frag]);
+        q[word + 0] = packed.x;
+        q[word + 4] = packed.z;
+    }
+    if (row0 + row_hi < ne1) {
+        uint32_t * q = reinterpret_cast<uint32_t *>(rows[row_hi * blocks_per_row].qs[frag]);
+        q[word + 0] = packed.y;
+        q[word + 4] = packed.w;
+    }
+    if (lane < MXFP8_MMA_TILE_ROWS && row0 + lane < ne1) {
+        rows[lane * blocks_per_row].e[frag] = src[tile].sc[frag][lane];
+    }
+}
+
+static bool ggml_backend_cuda_should_repack_mxfp8(
+        ggml_backend_buffer_t buffer, const ggml_tensor * tensor, const int device,
+        const size_t offset, const size_t size) {
+    return blackwell_mma_available(ggml_cuda_info().devices[device].cc) &&
+           tensor->type == GGML_TYPE_MXFP8 &&
+           ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+           tensor->view_src == nullptr && ggml_is_contiguous(tensor) &&
+           offset == 0 && size == ggml_nbytes(tensor);
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_backend_cuda_should_repack_mxfp8(buffer, tensor, ctx->device, offset, size)) {
+        void * staging = nullptr;
+        CUDA_CHECK(cudaMalloc(&staging, size));
+        CUDA_CHECK(cudaMemcpyAsync(staging, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+
+        const int64_t nplanes = tensor->ne[2] * tensor->ne[3];
+        const int64_t bpr     = ggml_cuda_mxfp8_blocks_per_row(tensor->ne[0]);
+        const int64_t trows   = ggml_cuda_mxfp8_tile_rows(tensor->ne[1]);
+        const int64_t ntiles  = ggml_cuda_mxfp8_ntiles(tensor->ne[0], tensor->ne[1], nplanes);
+        const dim3 block_dims(32, QK_MXFP8_FRAGS, 1);
+        ggml_cuda_repack_mxfp8_tiles<<<ntiles, block_dims, 0, cudaStreamPerThread>>>(
+            (const block_mxfp8 *) staging, (mxfp8_tile *) tensor->data, bpr, trows, tensor->ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(staging));
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -795,6 +901,23 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ggml_backend_cuda_should_repack_mxfp8(buffer, tensor, ctx->device, offset, size)) {
+        void * staging = nullptr;
+        CUDA_CHECK(cudaMalloc(&staging, size));
+
+        const int64_t nplanes = tensor->ne[2] * tensor->ne[3];
+        const int64_t bpr     = ggml_cuda_mxfp8_blocks_per_row(tensor->ne[0]);
+        const int64_t trows   = ggml_cuda_mxfp8_tile_rows(tensor->ne[1]);
+        const int64_t ntiles  = ggml_cuda_mxfp8_ntiles(tensor->ne[0], tensor->ne[1], nplanes);
+        const dim3 block_dims(32, QK_MXFP8_FRAGS, 1);
+        ggml_cuda_unpack_mxfp8_tiles<<<ntiles, block_dims, 0, cudaStreamPerThread>>>(
+            (const mxfp8_tile *) tensor->data, (block_mxfp8 *) staging, bpr, trows, tensor->ne[1]);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpyAsync(data, staging, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        CUDA_CHECK(cudaFree(staging));
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -921,6 +1044,12 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
+    }
+
+    // MXFP8 weights are stored permuted with the last 16-row tile padded
+    if (tensor->type == GGML_TYPE_MXFP8 && ne0 % QK_MXFP8 == 0) {
+        const size_t tiled = ggml_cuda_mxfp8_tiled_size(ne0, tensor->ne[1], tensor->ne[2] * tensor->ne[3]);
+        size = size > tiled ? size : tiled;
     }
 
     return size;
@@ -1799,6 +1928,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (src0->type == GGML_TYPE_MXFP8 && blackwell_mma_available(cc)) {
+        return false;
+    }
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
@@ -1812,6 +1944,25 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
     return use_mul_mat_vec_q;
+}
+
+static bool ggml_cuda_should_fuse_mxfp8_mma_1col(const ggml_tensor * tensor) {
+    if (tensor->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = tensor->src[0];
+    const ggml_tensor * src1 = tensor->src[1];
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                   src0->view_src;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || tensor->type != GGML_TYPE_F32 ||
+            tensor->ne[1] != 1 || src0->ne[0] % QK_MXFP8 != 0) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return ggml_cuda_should_use_mxfp8_mma_1col(src0->type, cc, src1->ne[1], src0->ne[1]);
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -1859,7 +2010,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+    // MXFP8 weights are always permuted, so the scalar mmvq path must never see them
+    const bool use_mmvq = src0->type == GGML_TYPE_MXFP8 && blackwell_mma_available(cc) ?
+        ggml_cuda_should_use_mxfp8_mma_1col(src0->type, cc, ne11, ne01) :
+        ggml_cuda_should_use_mmvq(src0->type, cc, ne11);
+    if (use_mmvq) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -3758,7 +3913,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            const bool use_mxfp8_mma_1col =
+                ggml_cuda_should_fuse_mul_mat(up_n, gate_n, glu, up_bias_n, gate_bias_n) &&
+                ggml_cuda_should_fuse_mxfp8_mma_1col(up_n) &&
+                ggml_are_same_stride(up_bias_tensor, glu) && ggml_are_same_stride(gate_bias_tensor, glu);
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n) || use_mxfp8_mma_1col) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -3799,7 +3958,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            const bool use_mxfp8_mma_1col =
+                ggml_cuda_should_fuse_mul_mat(up, gate, glu) && ggml_cuda_should_fuse_mxfp8_mma_1col(up);
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) || use_mxfp8_mma_1col) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -4946,6 +5107,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
                 }
+                // MXFP8 weights are stored permuted into 16-row MMA tiles, which assumes the
+                // serialized plane order. A reordered view of one cannot be addressed that way.
+                if (a->type == GGML_TYPE_MXFP8 && !ggml_is_contiguous(a)) {
+                    return false;
+                }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
@@ -4970,6 +5136,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_MXFP4:
+                    case GGML_TYPE_MXFP8:
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_Q2_K:
                     case GGML_TYPE_Q3_K:
@@ -5021,6 +5188,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_MXFP8:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
@@ -5060,6 +5228,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 ggml_type src0_type = op->src[0]->type;
                 ggml_type src1_type = op->src[1]->type;
+                const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+                // On Blackwell, uploaded MXFP8 tensors use a padded 16-row tile layout that the
+                // generic CPY kernel cannot safely copy using the serialized tensor byte count.
+                if (blackwell_mma_available(cc) &&
+                        (src0_type == GGML_TYPE_MXFP8 || src1_type == GGML_TYPE_MXFP8)) {
+                    return false;
+                }
                 if ((src0_type == GGML_TYPE_F32 || src0_type == GGML_TYPE_BF16 || src0_type == GGML_TYPE_F16) &&
                     (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_BF16 || src1_type == GGML_TYPE_F16)
                 ) {
@@ -5354,6 +5529,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // Blackwell MXFP8 weights are repacked into MMA tiles when they are loaded into a model
+    // buffer. Opportunistic op offload copies host weights into a compute buffer without that
+    // repack, so keep these matrix operations on the host instead of interpreting compact GGUF
+    // data as tiled CUDA data.
+    if (blackwell_mma_available(ggml_cuda_info().devices[dev_ctx->device].cc) &&
+            (op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
+            op->src[0] != nullptr && op->src[0]->type == GGML_TYPE_MXFP8) {
+        return false;
+    }
+
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
@@ -5467,6 +5652,7 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
         for (int id = 0; id < info.device_count; ++id) {
             if (blackwell_mma_available(info.devices[id].cc)) {
                 features.push_back({ "BLACKWELL_NATIVE_FP4", "1"});
+                features.push_back({ "BLACKWELL_NATIVE_MXFP8", "1"});
                 break;
             }
         }

@@ -73,6 +73,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_MXFP4:
             mul_mat_q_case<GGML_TYPE_MXFP4>(ctx, args, stream);
             break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_q_case<GGML_TYPE_MXFP8>(ctx, args, stream);
+            break;
         case GGML_TYPE_NVFP4:
             mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, args, stream);
             break;
@@ -129,6 +132,12 @@ void ggml_cuda_mul_mat_q(
     const bool fallback = ne01 % 128 != 0;
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
+    const bool use_native_mxfp8 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP8;
+    // permuted MXFP8 weights are addressed per 16-row tile
+    const bool use_mxfp8_tiles = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP8;
+    const int64_t s01_t = use_mxfp8_tiles ? ggml_cuda_mxfp8_blocks_per_row(ne00) : s01;
+    const int64_t s02_t = use_mxfp8_tiles ? ggml_cuda_mxfp8_tile_rows(ne01) * s01_t : s02;
+    const int64_t s03_t = use_mxfp8_tiles ? ne02 * s02_t : s03;
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
@@ -151,7 +160,10 @@ void ggml_cuda_mul_mat_q(
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
-
+            } else if (use_native_mxfp8) {
+                static_assert(sizeof(block_mxfp8_mmq) == 4 * sizeof(block_q8_1));
+                quantize_mmq_mxfp8_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                        ne10_padded, ne11, ne12, ne13, stream);
             } else {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
@@ -168,9 +180,9 @@ void ggml_cuda_mul_mat_q(
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
-            ne00, ne01, ne1, s01, ne11, s1,
-            ne02, ne12, s02, s12, s2,
-            ne03, ne13, s03, s13, s3,
+            ne00, ne01, ne1, s01_t, ne11, s1,
+            ne02, ne12, s02_t, s12, s2,
+            ne03, ne13, s03_t, s13, s3,
             ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
@@ -229,6 +241,14 @@ void ggml_cuda_mul_mat_q(
                 quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
+        } else if (use_native_mxfp8) {
+            if (dedup_bcast) {
+                quantize_scatter_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+                                                s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+            } else {
+                quantize_mmq_mxfp8_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+                                        ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
+            }
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
@@ -248,9 +268,9 @@ void ggml_cuda_mul_mat_q(
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
-        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
-        ne02, ne02, s02, s12, s2,
-        ne03, ne13, s03, s13, s3,
+        ne00, ne01, ne_get_rows, s01_t, ne_get_rows, s1,
+        ne02, ne02, s02_t, s12, s2,
+        ne03, ne13, s03_t, s13, s3,
         ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
@@ -260,6 +280,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
+
+    if (type == GGML_TYPE_MXFP8) {
+        return blackwell_mma_available(cc);
+    }
 
     bool mmq_supported;
 

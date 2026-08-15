@@ -328,6 +328,31 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
     return d * sumi;
 }
 
+#define VDR_MXFP8_Q8_1_MMVQ 4
+
+static __device__ __forceinline__ float vec_dot_mxfp8_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const block_mxfp8 * bq8x = (const block_mxfp8 *) vbq + kbx;
+    const int frag = iqs >> 3;
+    const int word = iqs & 7;
+    float sumf = 0.0f;
+#pragma unroll
+    for (int l = 0; l < VDR_MXFP8_Q8_1_MMVQ; ++l) {
+        const uint32_t x4 = ggml_cuda_e4m3x4_clear_nan(get_int_b4(bq8x->qs[frag], word + l));
+        const uint32_t y4 = get_int_b4(bq8_1[frag].qs, word + l);
+        const float2 x01 = ggml_cuda_e4m3x2_to_fp32x2(x4);
+        const float2 x23 = ggml_cuda_e4m3x2_to_fp32x2(x4 >> 16);
+        sumf += x01.x * float(int8_t(y4      ));
+        sumf += x01.y * float(int8_t(y4 >>  8));
+        sumf += x23.x * float(int8_t(y4 >> 16));
+        sumf += x23.y * float(int8_t(y4 >> 24));
+    }
+
+    const float d = ggml_cuda_e8m0_to_fp32(bq8x->e[frag]) * __low2float(bq8_1[frag].ds);
+    return d * sumf;
+}
+
 #define VDR_NVFP4_Q8_1_MMVQ 4
 #define VDR_NVFP4_Q8_1_MMQ  8
 

@@ -40,6 +40,49 @@
 #include "vendors/cuda.h"
 #endif // defined(GGML_USE_HIP)
 
+// MXFP8 weights are permuted once at load time into the m16n8k32 A-fragment order, so a loader
+// pulls a whole fragment with one aligned 16 byte load per lane. Codes and scales are grouped
+// separately inside each tile: a tile is 33*128 bytes, so every code fragment starts 128 byte
+// aligned and a 512 byte fragment read never straddles a sector. Rows are padded up to a whole
+// tile, which lets every MXFP8 weight use this layout regardless of its row count.
+#define MXFP8_MMA_TILE_ROWS 16
+#define QK_MXFP8_FRAGS      (QK_MXFP8 / QK_MXFP8_SUB)
+
+struct __align__(16) mxfp8_tile {
+    uint4   qs[QK_MXFP8_FRAGS][32];                  // lane-major A fragments
+    uint8_t sc[QK_MXFP8_FRAGS][MXFP8_MMA_TILE_ROWS]; // one e8m0 per row
+};
+
+static_assert(sizeof(mxfp8_tile) == MXFP8_MMA_TILE_ROWS * sizeof(block_mxfp8),
+              "an MXFP8 tile must stay the size of the 16 blocks it replaces");
+
+static inline __host__ __device__ int64_t ggml_cuda_mxfp8_tile_rows(const int64_t ne1) {
+    return (ne1 + MXFP8_MMA_TILE_ROWS - 1) / MXFP8_MMA_TILE_ROWS;
+}
+
+static inline __host__ __device__ int64_t ggml_cuda_mxfp8_blocks_per_row(const int64_t ne0) {
+    return ne0 / QK_MXFP8;
+}
+
+static inline __host__ __device__ int64_t ggml_cuda_mxfp8_ntiles(
+        const int64_t ne0, const int64_t ne1, const int64_t nplanes) {
+    return nplanes * ggml_cuda_mxfp8_tile_rows(ne1) * ggml_cuda_mxfp8_blocks_per_row(ne0);
+}
+
+static inline __host__ __device__ size_t ggml_cuda_mxfp8_tiled_size(
+        const int64_t ne0, const int64_t ne1, const int64_t nplanes) {
+    return (size_t) ggml_cuda_mxfp8_ntiles(ne0, ne1, nplanes) * sizeof(mxfp8_tile);
+}
+
+// which lane/register of a fragment holds a given row's 4-byte word
+static inline __host__ __device__ int ggml_cuda_mxfp8_frag_lane(const int row, const int word) {
+    return ((row & 7) << 2) + (word & 3);
+}
+
+static inline __host__ __device__ int ggml_cuda_mxfp8_frag_reg(const int row, const int word) {
+    return (row >> 3) + ((word >> 2) << 1);
+}
+
 #define STRINGIZE_IMPL(...) #__VA_ARGS__
 #define STRINGIZE(...) STRINGIZE_IMPL(__VA_ARGS__)
 
@@ -866,6 +909,54 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
 }
 
+static __device__ __forceinline__ float ggml_cuda_e4m3_to_fp32(uint8_t x) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const uint32_t bits = x * ((x & 0x7F) != 0x7F);
+    const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
+    return static_cast<float>(xf);
+#else
+    if ((x & 0x7F) == 0x7F) {
+        return 0.0f;
+    }
+
+    const float sign = x & 0x80 ? -1.0f : 1.0f;
+    const int exp = (x >> 3) & 0x0F;
+    const int man = x & 0x07;
+    if (exp == 0) {
+        return sign * ldexpf((float) man, -9);
+    }
+    return sign * ldexpf(1.0f + (float) man / 8.0f, exp - 7);
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+}
+
+// e4m3 has no infinity, 0x7F/0xFF are NaN. Clear them so they convert to 0.0f like the CPU code does.
+static __device__ __forceinline__ uint32_t ggml_cuda_e4m3x4_clear_nan(uint32_t x4) {
+    return x4 & ~__vcmpeq4(x4 | 0x80808080, 0xFFFFFFFF);
+}
+
+// 2 packed e4m3 codes in the low 16 bits. NaN codes are not handled here,
+// run the input through ggml_cuda_e4m3x4_clear_nan first if that is needed.
+static __device__ __forceinline__ float2 ggml_cuda_e4m3x2_to_fp32x2(uint32_t x2) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const __half2_raw h2 = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) (x2 & 0xFFFF), __NV_E4M3);
+    return __half22float2(*reinterpret_cast<const __half2 *>(&h2));
+#else
+    return make_float2(ggml_cuda_e4m3_to_fp32(x2 & 0xFF), ggml_cuda_e4m3_to_fp32((x2 >> 8) & 0xFF));
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+}
+
+static __device__ __forceinline__ int32_t ggml_cuda_e4m3_to_i32_x512(uint8_t x) {
+    const uint8_t abs_code = x & 0x7F;
+    if (abs_code == 0 || abs_code == 0x7F) {
+        return 0;
+    }
+
+    const int exp = (abs_code >> 3) & 0x0F;
+    const int man = abs_code & 0x07;
+    const int32_t mag = exp == 0 ? man : (int32_t) (8 + man) << (exp - 1);
+    return x & 0x80 ? -mag : mag;
+}
+
 static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
 #if defined(BLACKWELL_MMA_AVAILABLE) // This is used for NVFP4 subblock scale quantizations only
     if (!(x > 0.0f)) {
@@ -1025,6 +1116,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
     static constexpr int qi = QI_MXFP4;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_MXFP8> {
+    static constexpr int qk = QK_MXFP8;
+    static constexpr int qr = QR_MXFP8;
+    static constexpr int qi = QI_MXFP8;
 };
 
 template<>

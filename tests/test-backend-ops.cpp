@@ -4557,6 +4557,9 @@ struct test_mul_mat : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        if (type_a == GGML_TYPE_MXFP8 && backend_has_feature(backend, "BLACKWELL_NATIVE_MXFP8")) {
+            return 2e-2;
+        }
         return max_nmse_err();
     }
 
@@ -4756,6 +4759,9 @@ struct test_mul_mat_id : public test_case {
     double max_nmse_err(ggml_backend_t backend) override {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        if (type_a == GGML_TYPE_MXFP8 && backend_has_feature(backend, "BLACKWELL_NATIVE_MXFP8")) {
             return 2e-2;
         }
         return max_nmse_err();
@@ -6658,6 +6664,13 @@ struct test_mul_mat_vec_fusion : public test_case {
     double max_nmse_err() override {
         return 5e-3;
     }
+
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (type == GGML_TYPE_MXFP8 && backend_has_feature(backend, "BLACKWELL_NATIVE_MXFP8")) {
+            return 2e-2;
+        }
+        return max_nmse_err();
+    }
 };
 
 // GGML_OP_SUM
@@ -8397,7 +8410,7 @@ static const ggml_type all_types[] = {
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,
     GGML_TYPE_Q2_0,
-    GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
+    GGML_TYPE_MXFP4, GGML_TYPE_MXFP8, GGML_TYPE_NVFP4,
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
     GGML_TYPE_Q6_K,
@@ -8416,7 +8429,7 @@ static const ggml_type base_types[] = {
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
     GGML_TYPE_Q4_K,
-    GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, // TODO: or "other"
+    GGML_TYPE_MXFP4, GGML_TYPE_MXFP8, GGML_TYPE_NVFP4, // TODO: or "other"
     GGML_TYPE_IQ2_XXS
 };
 
@@ -9327,6 +9340,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP8, GGML_TYPE_F32, 64, 1, 256, {1, 1}, {2, 2}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
     for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
@@ -10224,6 +10238,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
     }
+
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(
+        GGML_TYPE_MXFP8, GGML_GLU_OP_SWIGLU, 1, 64, 256, false, 1, 1, false, false, true, false, {1, 1}));
 
     for (auto gate : {GATING_FUNC_SOFTMAX, GATING_FUNC_SIGMOID, GATING_FUNC_SOFTMAX_WEIGHT, GATING_FUNC_SQRT_SOFTPLUS}) {
         for (bool with_norm : {false, true}) {

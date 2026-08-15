@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mma.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -18,6 +19,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
+        case GGML_TYPE_MXFP8:   return vec_dot_mxfp8_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
@@ -47,6 +49,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
+        case GGML_TYPE_MXFP8:   return VDR_MXFP8_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
@@ -254,6 +257,10 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    // permuted MXFP8 weights have no scalar vec_dot, MUL_MAT_ID goes through MMQ instead
+    if (type == GGML_TYPE_MXFP8 && blackwell_mma_available(cc)) {
+        return 0;
+    }
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -370,6 +377,241 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
         }
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
+}
+
+bool ggml_cuda_should_use_mxfp8_mma_1col(enum ggml_type type, int cc, int64_t ne11, int64_t ne01) {
+    GGML_UNUSED(ne01);
+    return type == GGML_TYPE_MXFP8 && blackwell_mma_available(cc) && ne11 == 1;
+}
+
+// weights are pre-permuted into A-fragment order: one aligned 16 byte load per lane
+static __device__ __forceinline__ void load_mxfp8_tileA_1col_mmvq(
+        ggml_cuda_mma::tile<16, 8, int> & A, uint32_t & scaleA,
+        const mxfp8_tile * GGML_CUDA_RESTRICT tiles,
+        const int64_t tile_base, const int frag_abs32) {
+    const int lane = int(threadIdx.x) & 31;
+    const mxfp8_tile & tile = tiles[tile_base + (frag_abs32 >> 3)];
+    const int frag = frag_abs32 & 7;
+
+    const uint4 packed = tile.qs[frag][lane];
+    int * ax = reinterpret_cast<int *>(A.x);
+    ax[0] = int(packed.x);
+    ax[1] = int(packed.y);
+    ax[2] = int(packed.z);
+    ax[3] = int(packed.w);
+
+    // tidA 0 supplies rows 0..7 and tidA 1 supplies rows 8..15 within each quad
+    scaleA = tile.sc[frag][(lane >> 2) + (lane & 1) * 8];
+}
+
+static __device__ __forceinline__ void load_mxfp8_tileB_1col_mmvq(
+        ggml_cuda_mma::tile<8, 8, int> & B, uint32_t & scaleB,
+        const block_mxfp8_mmq * GGML_CUDA_RESTRICT y, const int frag_abs32) {
+    const int lane      = int(threadIdx.x) & 31;
+    const int block_rel = frag_abs32 >> 2;
+    const int frag_idx  = frag_abs32 & 3;
+    const block_mxfp8_mmq & block = y[block_rel];
+    int * bx = reinterpret_cast<int *>(B.x);
+
+    if (lane < 4) {
+        const uint32_t * q = reinterpret_cast<const uint32_t *>(block.qs + frag_idx * QK_MXFP8_SUB);
+        bx[0] = int(q[lane]);
+        bx[1] = int(q[lane + 4]);
+    } else {
+        bx[0] = 0;
+        bx[1] = 0;
+    }
+
+    // quantize_mmq_mxfp8 stores one e8m0 per d4 word, same address for the whole warp
+    scaleB = block.d4[frag_idx];
+}
+
+#define GGML_CUDA_MXFP8_1COL_MIN_BLOCKS(W) ((W) <= 16 ? 2 : 1)
+
+template <int warps_per_tile, bool has_gate, bool has_x_bias, bool has_gate_bias, bool is_2d = false>
+static __global__ __launch_bounds__(32 * warps_per_tile, GGML_CUDA_MXFP8_1COL_MIN_BLOCKS(warps_per_tile))
+void mul_mat_vec_mxfp8_mma_1col(
+        const mxfp8_tile * vx_ptr, const mxfp8_tile * vgate_ptr,
+        const block_mxfp8_mmq * y_ptr,
+        const float * x_bias_ptr, const float * gate_bias_ptr,
+        const ggml_glu_op glu_op, const float glu_limit, float * dst_ptr, const int nfrags32, const int nrows,
+        const int tiles_per_row, const int tile_stride_channel, const int tile_stride_sample,
+        const int stride_channel_y, const int stride_sample_y,
+        const int stride_channel_dst, const int stride_sample_dst,
+        const int channel_ratio, const int sample_ratio) {
+    using namespace ggml_cuda_mma;
+    typedef tile<16, 8, int> tile_A;
+    typedef tile<8, 8, int>  tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    ggml_cuda_pdl_sync();
+
+    const mxfp8_tile      * GGML_CUDA_RESTRICT vx        = vx_ptr;
+    const mxfp8_tile      * GGML_CUDA_RESTRICT vgate     = vgate_ptr;
+    const block_mxfp8_mmq * GGML_CUDA_RESTRICT y         = y_ptr;
+    const float           * GGML_CUDA_RESTRICT x_bias    = x_bias_ptr;
+    const float           * GGML_CUDA_RESTRICT gate_bias = gate_bias_ptr;
+    float                 * GGML_CUDA_RESTRICT dst       = dst_ptr;
+
+    const int row_base = MXFP8_MMA_TILE_ROWS * int(blockIdx.x);
+    int channel_dst = 0;
+    int sample_dst  = 0;
+    int64_t tile_base = int64_t(blockIdx.x) * tiles_per_row;
+    if constexpr (!is_2d) {
+        channel_dst = int(blockIdx.y);
+        sample_dst  = int(blockIdx.z);
+        const int channel_x = channel_ratio == 1 ? channel_dst : channel_dst / channel_ratio;
+        const int sample_x  = sample_ratio  == 1 ? sample_dst  : sample_dst  / sample_ratio;
+        tile_base = int64_t(sample_x) * tile_stride_sample + int64_t(channel_x) * tile_stride_channel +
+                    int64_t(blockIdx.x) * tiles_per_row;
+    }
+
+    const block_mxfp8_mmq * y_cur = y + sample_dst * stride_sample_y + channel_dst * stride_channel_y;
+
+    const int lane    = int(threadIdx.x);
+    const int warp_id = int(threadIdx.y);
+    tile_C C;
+    tile_C C_gate;
+
+    // the kernel is DRAM bound, so walk two k halves at once to keep 2 loads per warp in flight.
+    // nfrags32 is a multiple of 8 because a row is a whole number of QK_MXFP8 blocks.
+    const int nfrags_half = nfrags32 >> 1;
+
+    for (int frag = warp_id; frag < nfrags_half; frag += warps_per_tile) {
+        tile_B B0;
+        tile_B B1;
+        uint32_t scaleB0;
+        uint32_t scaleB1;
+        load_mxfp8_tileB_1col_mmvq(B0, scaleB0, y_cur, frag);
+        load_mxfp8_tileB_1col_mmvq(B1, scaleB1, y_cur, frag + nfrags_half);
+
+        tile_A A0;
+        tile_A A1;
+        uint32_t scaleA0;
+        uint32_t scaleA1;
+        load_mxfp8_tileA_1col_mmvq(A0, scaleA0, vx, tile_base, frag);
+        load_mxfp8_tileA_1col_mmvq(A1, scaleA1, vx, tile_base, frag + nfrags_half);
+        mma_block_scaled_mxfp8(C, A0, B0, scaleA0, scaleB0);
+        mma_block_scaled_mxfp8(C, A1, B1, scaleA1, scaleB1);
+
+        if constexpr (has_gate) {
+            load_mxfp8_tileA_1col_mmvq(A0, scaleA0, vgate, tile_base, frag);
+            load_mxfp8_tileA_1col_mmvq(A1, scaleA1, vgate, tile_base, frag + nfrags_half);
+            mma_block_scaled_mxfp8(C_gate, A0, B0, scaleA0, scaleB0);
+            mma_block_scaled_mxfp8(C_gate, A1, B1, scaleA1, scaleB1);
+        }
+    }
+
+    ggml_cuda_pdl_lc();
+
+    __shared__ float partial[has_gate ? 2 : 1][warps_per_tile][16];
+    if ((lane & 3) == 0) {
+        const int row_part = lane >> 2;
+        partial[0][warp_id][row_part + 0] = C.x[0];
+        partial[0][warp_id][row_part + 8] = C.x[2];
+    }
+
+    if constexpr (has_gate) {
+        if ((lane & 3) == 0) {
+            const int row_part = lane >> 2;
+            partial[1][warp_id][row_part + 0] = C_gate.x[0];
+            partial[1][warp_id][row_part + 8] = C_gate.x[2];
+        }
+    }
+    __syncthreads();
+
+    // the last tile is padded, so only real rows may be written
+    if (warp_id == 0 && lane < 16 && row_base + lane < nrows) {
+        float result = 0.0f;
+        float gate_value = 0.0f;
+#pragma unroll
+        for (int warp = 0; warp < warps_per_tile; ++warp) {
+            result += partial[0][warp][lane];
+            if constexpr (has_gate) {
+                gate_value += partial[1][warp][lane];
+            }
+        }
+
+        const int dst_idx = is_2d ?
+            row_base + lane :
+            sample_dst * stride_sample_dst + channel_dst * stride_channel_dst + row_base + lane;
+        if constexpr (has_x_bias) {
+            result += x_bias[dst_idx];
+        }
+        if constexpr (has_gate) {
+            if constexpr (has_gate_bias) {
+                gate_value += gate_bias[dst_idx];
+            }
+            switch (glu_op) {
+                case GGML_GLU_OP_SWIGLU:
+                    result *= ggml_cuda_op_silu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_GEGLU:
+                    result *= ggml_cuda_op_gelu_single(gate_value);
+                    break;
+                case GGML_GLU_OP_SWIGLU_OAI:
+                    result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                    break;
+                case GGML_GLU_OP_SWIGLU_CLAMP:
+                    result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, glu_limit);
+                    break;
+                default:
+                    result *= gate_value;
+                    break;
+            }
+        }
+        dst[dst_idx] = result;
+    }
+}
+
+template <int warps_per_tile>
+static void launch_mul_mat_vec_mxfp8_mma_1col(
+        const mxfp8_tile * src0, const ggml_cuda_mm_fusion_args_device & fusion,
+        const block_mxfp8_mmq * src1, float * dst, const int nfrags32,
+        const int nrows, const int nchannels_dst, const int nsamples_dst,
+        const int tiles_per_row, const int tile_stride_channel, const int tile_stride_sample,
+        const int stride_channel_y, const int stride_sample_y,
+        const int stride_channel_dst, const int stride_sample_dst,
+        const int channel_ratio, const int sample_ratio, cudaStream_t stream) {
+    const dim3 block_nums(ggml_cuda_mxfp8_tile_rows(nrows), nchannels_dst, nsamples_dst);
+    const dim3 block_dims(32, warps_per_tile, 1);
+    const ggml_cuda_kernel_launch_params launch_params(block_nums, block_dims, 0, stream);
+
+    const bool is_2d = nchannels_dst == 1 && nsamples_dst == 1 && channel_ratio == 1 && sample_ratio == 1 &&
+        fusion.x_bias == nullptr && fusion.gate_bias == nullptr;
+
+#define GGML_CUDA_LAUNCH_MXFP8_1COL(has_gate, has_x_bias, has_gate_bias, is_2d)                              \
+    ggml_cuda_kernel_launch(                                                                                 \
+        mul_mat_vec_mxfp8_mma_1col<warps_per_tile, has_gate, has_x_bias, has_gate_bias, is_2d>,              \
+        launch_params, src0, (const mxfp8_tile *) fusion.gate, src1,                                            \
+        (const float *) fusion.x_bias, (const float *) fusion.gate_bias, fusion.glu_op, fusion.glu_limit,   \
+        dst, nfrags32,                                                                                      \
+        nrows, tiles_per_row, tile_stride_channel, tile_stride_sample,                                      \
+        stride_channel_y, stride_sample_y, stride_channel_dst, stride_sample_dst,                            \
+        channel_ratio, sample_ratio)
+
+    if (is_2d) {
+        if (fusion.gate == nullptr) {
+            GGML_CUDA_LAUNCH_MXFP8_1COL(false, false, false, true);
+        } else {
+            GGML_CUDA_LAUNCH_MXFP8_1COL(true, false, false, true);
+        }
+    } else if (fusion.gate != nullptr) {
+        if (fusion.x_bias != nullptr && fusion.gate_bias != nullptr) {
+            GGML_CUDA_LAUNCH_MXFP8_1COL(true, true, true, false);
+        } else if (fusion.x_bias != nullptr) {
+            GGML_CUDA_LAUNCH_MXFP8_1COL(true, true, false, false);
+        } else if (fusion.gate_bias != nullptr) {
+            GGML_CUDA_LAUNCH_MXFP8_1COL(true, false, true, false);
+        } else {
+            GGML_CUDA_LAUNCH_MXFP8_1COL(true, false, false, false);
+        }
+    } else {
+        GGML_ASSERT(fusion.x_bias == nullptr && fusion.gate_bias == nullptr);
+        GGML_CUDA_LAUNCH_MXFP8_1COL(false, false, false, false);
+    }
+
+#undef GGML_CUDA_LAUNCH_MXFP8_1COL
 }
 
 // Device constexpr: returns the max batch size for the current arch+type at compile time.
@@ -1155,6 +1397,12 @@ static void mul_mat_vec_q_switch_type(
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
             break;
+        case GGML_TYPE_MXFP8:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP8>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
         case GGML_TYPE_NVFP4:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NVFP4>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
@@ -1329,17 +1577,31 @@ void ggml_cuda_mul_mat_vec_q(
         }
     }
 
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const bool use_mxfp8_mma_1col =
+        !ids && ggml_cuda_should_use_mxfp8_mma_1col(src0->type, cc, ne11, ne01);
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const int64_t blocks_per_row_y = use_mxfp8_mma_1col ? ne10_padded / (4 * QK8_1) : ne10_padded / QK8_1;
+    const size_t block_size_y = use_mxfp8_mma_1col ? sizeof(block_mxfp8_mmq) : sizeof(block_q8_1);
+    const size_t nbytes_src1 = size_t(ne13 * ne12 * ne11 * blocks_per_row_y) * block_size_y;
+    ggml_cuda_pool_alloc<char> src1_q(ctx.pool(), nbytes_src1);
     {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        const int64_t s11_src1 = src1->nb[1] / ts_src1;
+        const int64_t s12_src1 = src1->nb[2] / ts_src1;
+        const int64_t s13_src1 = src1->nb[3] / ts_src1;
+        if (use_mxfp8_mma_1col) {
+            quantize_mmq_mxfp8_cuda(src1_d, nullptr, src1_q.get(), src0->type,
+                ne10, s11_src1, s12_src1, s13_src1, ne10_padded, ne11, ne12, ne13, stream);
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q.get(), src0->type,
+                ne10, s11_src1, s12_src1, s13_src1, ne10_padded, ne11, ne12, ne13, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
-    const int64_t s11 = ne10_padded / QK8_1;
+    const int64_t s11 = blocks_per_row_y;
     const int64_t s1  =  dst->nb[1] / ts_dst;
     const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
@@ -1360,8 +1622,26 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    if (use_mxfp8_mma_1col) {
+        GGML_ASSERT(!ids && ncols_dst == 1 && ne00 % QK_MXFP8 == 0);
+        GGML_ASSERT(fusion_local.x_scale == nullptr && fusion_local.gate_scale == nullptr);
+        GGML_ASSERT(nchannels_dst % ne02 == 0 && ne3 % ne03 == 0);
+        // 16 warps let 2 blocks live on one SM and split nfrags32 (a multiple of 8) evenly
+        constexpr int warps_per_tile = 16;
+        const int     tiles_per_row = int(ggml_cuda_mxfp8_blocks_per_row(ne00));
+        const int     tile_stride_channel = int(ggml_cuda_mxfp8_tile_rows(ne01)) * tiles_per_row;
+        const int     tile_stride_sample  = int(ne02) * tile_stride_channel;
+        launch_mul_mat_vec_mxfp8_mma_1col<warps_per_tile>(
+            (const mxfp8_tile *) src0->data, fusion_local, (const block_mxfp8_mmq *) src1_q.get(), dst_d,
+            int(ne00 / QK_MXFP8_SUB), int(ne01), int(nchannels_dst), int(ne3),
+            tiles_per_row, tile_stride_channel, tile_stride_sample,
+            int(stride_channel_y), int(s13), int(stride_channel_dst), int(s3),
+            int(nchannels_dst / ne02), int(ne3 / ne03), stream);
+        return;
+    }
+
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

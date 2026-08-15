@@ -347,6 +347,31 @@ static inline int best_index_mxfp4(float x, float e) {
     return best_index;
 }
 
+static inline uint8_t best_index_mxfp8(float x) {
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+
+    const uint8_t sign = (uint8_t) (bits >> 24) & 0x80;
+    bits &= 0x7FFFFFFF;
+
+    if (bits == 0) {
+        return sign;
+    }
+    if (bits >= 0x43E00000) {
+        return sign | 0x7E;
+    }
+    if (bits < 0x3C800000) {
+        const float v = fabsf(x) * 512.0f;
+        int q = (int) v;
+        const float r = v - q;
+        q += r > 0.5f || (r == 0.5f && (q & 1));
+        return sign | (uint8_t) q;
+    }
+
+    bits += 0x0007FFFF + ((bits >> 20) & 1);
+    return sign | (uint8_t) ((bits >> 20) - (120 << 3));
+}
+
 void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_MXFP4;
 
@@ -377,6 +402,38 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
 
             y[i].qs[j]  = x0;
             y[i].qs[j] |= x1 << 4;
+        }
+    }
+}
+
+void quantize_row_mxfp8_ref(const float * GGML_RESTRICT x, block_mxfp8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+    static const int qk_sub = QK_MXFP8_SUB;
+    static const int n_sub = QK_MXFP8 / QK_MXFP8_SUB;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        for (int s = 0; s < n_sub; s++) {
+            const float * xb = x + i*qk + s*qk_sub;
+            float amax = 0.0f;
+
+            for (int j = 0; j < qk_sub; j++) {
+                amax = MAX(amax, fabsf(xb[j]));
+            }
+
+            const float scale = amax / 448.0f;
+            int exponent;
+            const float mantissa = frexpf(scale, &exponent);
+            const int e = amax > 0.0f ? MAX(0, MIN(254, exponent + 126 + (mantissa > 0.5f))) : 127;
+            const float id = 1.0f / GGML_E8M0_TO_FP32(e);
+            y[i].e[s] = e;
+
+            for (int j = 0; j < qk_sub; j++) {
+                y[i].qs[s][j] = best_index_mxfp8(xb[j] * id);
+            }
         }
     }
 }
@@ -2326,6 +2383,12 @@ size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     GGML_UNUSED(quant_weights);
     quantize_row_mxfp4_ref(src, dst, (int64_t)nrow*n_per_row);
     return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
+}
+
+size_t quantize_mxfp8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_mxfp8_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_MXFP8, n_per_row);
 }
 
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {

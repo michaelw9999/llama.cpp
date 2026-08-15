@@ -1249,3 +1249,71 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_mxfp8_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+
+    typedef tile<16, 8, int>   tile_A;
+    typedef tile<8,  8, int>   tile_B;
+    typedef tile<16, 8, float> tile_C;
+
+    constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp / tile_C::I;
+    constexpr int nfrags        = MMQ_TILE_NE_K / tile_A::J;
+
+    y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+    const int *      x_qs = x;
+    const uint32_t * x_sc = (const uint32_t *) (x_qs + 2 * MMQ_TILE_NE_K);
+    const int *      y_qs = y + 4;
+    const uint32_t * y_sc = (const uint32_t *) y;
+
+    const int tidx_A = threadIdx.x / 4 + (threadIdx.x % 2) * 8;
+    const int tidx_B = threadIdx.x / 4;
+    const int i0     = (threadIdx.y / ntx) * rows_per_warp;
+
+    tile_A   A[ntx][nfrags];
+    uint32_t scaleA[ntx][nfrags];
+
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = k00 + frag * tile_A::J;
+            load_ldmatrix(A[n][frag], x_qs + (i0 + n * tile_A::I) * sram_stride + k0, sram_stride);
+            scaleA[n][frag] = x_sc[(i0 + n * tile_A::I + tidx_A) * sram_stride + k0 / tile_A::J];
+        }
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+        tile_B   B[nfrags];
+        uint32_t scaleB[nfrags];
+
+#pragma unroll
+        for (int frag = 0; frag < nfrags; ++frag) {
+            const int k0 = frag * tile_B::J;
+            load_generic(B[frag], y_qs + j0 * MMQ_TILE_Y_K + k0, MMQ_TILE_Y_K);
+            scaleB[frag] = y_sc[(j0 + tidx_B) * MMQ_TILE_Y_K + frag];
+        }
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            const int sum_offset = (j0 / tile_C::J + n) * tile_C::ne;
+            tile_C C;
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                C.x[l] = sum[sum_offset + l];
+            }
+#pragma unroll
+            for (int frag = 0; frag < nfrags; ++frag) {
+                mma_block_scaled_mxfp8(C, A[n][frag], B[frag], scaleA[n][frag], scaleB[frag]);
+            }
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                sum[sum_offset + l] = C.x[l];
+            }
+        }
+    }
+}
